@@ -1,6 +1,5 @@
 package main
 
-// 收录规则与内容解析
 import (
 	"bytes"
 	"encoding/json"
@@ -14,7 +13,6 @@ import (
 	"strings"
 )
 
-// 占位作者集
 var placeholderSet = func() map[string]bool {
 	rows := []string{
 		"admin",
@@ -65,7 +63,6 @@ var placeholderSet = func() map[string]bool {
 	return set
 }()
 
-// 是否占位
 func isPlaceholder(text string) bool {
 	word := strings.ToLower(strings.TrimSpace(text))
 	if word == "" {
@@ -74,7 +71,6 @@ func isPlaceholder(text string) bool {
 	return placeholderSet[word] || placeholderSet[strings.ReplaceAll(word, "_", " ")]
 }
 
-// 域名规范化
 func normalizeHost(raw string) string {
 	word := strings.TrimSpace(raw)
 	if word == "" {
@@ -115,7 +111,6 @@ func normalizeHost(raw string) string {
 	return lower
 }
 
-// 注册域推算
 func registrableOf(host string) string {
 	suffix, icann := publicsuffix.PublicSuffix(host)
 	if !icann || suffix == "" || !strings.HasSuffix(host, suffix) {
@@ -129,7 +124,6 @@ func registrableOf(host string) string {
 	return strings.Join(labels[len(labels)-suffixLabels-1:], ".")
 }
 
-// 域名收录判定
 func Judge(raw string) string {
 	host := normalizeHost(raw)
 	if host == "" {
@@ -148,7 +142,6 @@ func Judge(raw string) string {
 	return host
 }
 
-// 页面抽取值
 type Page struct {
 	Name      string
 	Author    string
@@ -159,7 +152,6 @@ type Page struct {
 	Friends   []string
 }
 
-// 订阅抽取值
 type Subscription struct {
 	Parsed   bool
 	Name     string
@@ -167,23 +159,47 @@ type Subscription struct {
 	Language string
 }
 
-// 友链路径表
 var friendPaths = []string{"/links", "/friends", "/link"}
 
-// 版权标记式
 var copyrightPattern = regexp.MustCompile(`(?i)(?:©|\(c\)|copyright)\s*(?:\d{4}(?:\s*[-–~至]\s*\d{4})?)?\s*`)
 
-// 空白归一
 func collapse(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
 
-// 语言归一
 func normalizeLang(text string) string {
-	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(text), "_", "-"))
+	word := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(text), "_", "-"))
+	if word == "" || len([]rune(word)) > 20 {
+		return ""
+	}
+	for _, part := range strings.Split(word, "-") {
+		if part == "" || len(part) > 8 || strings.Trim(part, "abcdefghijklmnopqrstuvwxyz0123456789") != "" {
+			return ""
+		}
+	}
+	return word
 }
 
-// JSON-LD取名
+func cleanTitle(text string) string {
+	name := collapse(text)
+	for _, cut := range []string{" - ", " _ ", " | ", " ｜ ", " · ", " — ", " – ", " » "} {
+		if index := strings.Index(name, cut); index > 0 {
+			if head := strings.TrimSpace(name[:index]); head != "" && len([]rune(head)) <= 30 {
+				name = head
+				break
+			}
+		}
+	}
+	if runes := []rune(name); len(runes) > 50 {
+		name = string(runes[:50])
+	}
+	return name
+}
+
+func isContact(text string) bool {
+	return strings.Contains(text, "@") || strings.Contains(text, "://")
+}
+
 func jsonldAuthor(texts []string) string {
 	var person struct {
 		Graph []struct {
@@ -215,7 +231,6 @@ func jsonldAuthor(texts []string) string {
 	return ""
 }
 
-// 读节点属性
 func attribute(node *html.Node, key string) string {
 	for _, attr := range node.Attr {
 		if strings.EqualFold(attr.Key, key) {
@@ -225,27 +240,21 @@ func attribute(node *html.Node, key string) string {
 	return ""
 }
 
-// 链接绝对化
 func absoluteURL(link, origin string) *url.URL {
-	if parsed, failure := url.Parse(link); failure == nil && parsed.IsAbs() {
-		return parsed
-	}
 	root, failure := url.Parse(origin)
 	if failure != nil {
 		return nil
 	}
-	return root.ResolveReference(&url.URL{Path: link})
-}
-
-// 链接绝对化取串
-func absoluteLink(link, origin string) string {
-	if parsed := absoluteURL(link, origin); parsed != nil {
-		return parsed.String()
+	parsed, failure := url.Parse(link)
+	if failure != nil {
+		return nil
 	}
-	return ""
+	if parsed.IsAbs() {
+		return parsed
+	}
+	return root.ResolveReference(parsed)
 }
 
-// 取节点文本
 func nodeText(node *html.Node) string {
 	var buffer bytes.Buffer
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
@@ -257,7 +266,6 @@ func nodeText(node *html.Node) string {
 	return collapse(buffer.String())
 }
 
-// 抽取页面字段
 func ParsePage(body []byte, origin string) Page {
 	var page Page
 	document, failure := html.Parse(bytes.NewReader(body))
@@ -266,6 +274,7 @@ func ParsePage(body []byte, origin string) Page {
 	}
 	var title, stated, generator, language string
 	originRegistrable := registrableOf(normalizeHost(origin))
+	hostCache := map[string]string{}
 	var texts strings.Builder
 	var jsonlds []string
 	length := 0
@@ -296,10 +305,12 @@ func ParsePage(body []byte, origin string) Page {
 				language = normalizeLang(attribute(node, "lang"))
 			case "link":
 				if page.Feed == "" && strings.Contains(strings.ToLower(attribute(node, "rel")), "alternate") {
-					kind := strings.ToLower(attribute(node, "type"))
-					link := attribute(node, "href")
-					if link != "" && (strings.Contains(kind, "atom") || strings.Contains(kind, "rss") || strings.Contains(kind, "feed+json")) {
-						page.Feed = absoluteLink(link, origin)
+					kind, link := strings.ToLower(attribute(node, "type")), attribute(node, "href")
+					if link != "" && (strings.Contains(kind, "atom") || strings.Contains(kind, "rss") ||
+						strings.Contains(kind, "feed+json")) {
+						if parsed := absoluteURL(link, origin); parsed != nil {
+							page.Feed = parsed.String()
+						}
 					}
 				}
 			case "a":
@@ -309,7 +320,11 @@ func ParsePage(body []byte, origin string) Page {
 				}
 				parsed := absoluteURL(link, origin)
 				if parsed != nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
-					hostname := normalizeHost(parsed.Host)
+					hostname, ok := hostCache[parsed.Host]
+					if !ok {
+						hostname = normalizeHost(parsed.Host)
+						hostCache[parsed.Host] = hostname
+					}
 					if len(page.Links) < 200 {
 						page.Links = append(page.Links, hostname)
 					}
@@ -334,34 +349,25 @@ func ParsePage(body []byte, origin string) Page {
 		}
 	}
 	walk(document)
-	page.Name = collapse(title)
-	for _, cut := range []string{" - ", " _ ", " | ", " ｜ ", " · ", " — ", " – ", " » "} {
-		if index := strings.Index(page.Name, cut); index > 0 {
-			if head := strings.TrimSpace(page.Name[:index]); head != "" && len([]rune(head)) <= 30 {
-				page.Name = head
-				break
-			}
-		}
-	}
-	if runes := []rune(page.Name); len(runes) > 50 {
-		page.Name = string(runes[:50])
-	}
+	page.Name = cleanTitle(title)
 	page.Language = language
 	page.Framework = detectFramework(generator, body)
 	author := strings.TrimSpace(stated)
-	if isPlaceholder(author) {
-		if name := jsonldAuthor(jsonlds); name != "" {
+	if isPlaceholder(author) || isContact(author) {
+		author = ""
+	}
+	if author == "" {
+		if name := jsonldAuthor(jsonlds); name != "" && !isContact(name) {
 			author = name
 		}
 	}
-	if isPlaceholder(author) {
+	if author == "" {
 		author = copyrightName(collapse(texts.String()))
 	}
 	page.Author = author
 	return page
 }
 
-// 版权行取作者
 func copyrightName(text string) string {
 	match := copyrightPattern.FindStringIndex(text)
 	if match == nil {
@@ -387,7 +393,68 @@ func copyrightName(text string) string {
 	return phrase
 }
 
-// 识别托管框架
+func generatorName(stated string) string {
+	word := collapse(stated)
+	for _, noise := range []string{"(", ")", "seo", "plugin", "rocket", "cache", "minify", "compress"} {
+		if strings.Contains(strings.ToLower(word), noise) {
+			return ""
+		}
+	}
+	fields := strings.Fields(word)
+	for len(fields) > 1 && strings.ContainsAny(fields[len(fields)-1], "0123456789") {
+		fields = fields[:len(fields)-1]
+	}
+	word = collapse(strings.Join(fields, " "))
+	if word == "" || len([]rune(word)) > 30 {
+		return ""
+	}
+	if strings.Contains(word, "'s ") || strings.Contains(word, "’s ") {
+		return ""
+	}
+	return word
+}
+
+func softMissing(title string) bool {
+	word := collapse(title)
+	for _, mark := range []string{"404", "Not Found", "not found", "页面不存在", "找不到页面", "Access denied"} {
+		if strings.Contains(word, mark) {
+			return true
+		}
+	}
+	return false
+}
+
+func lowerByte(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
+}
+
+func containsFold(haystack []byte, needle string) bool {
+	if len(needle) == 0 || len(haystack) < len(needle) {
+		return false
+	}
+	first := needle[0]
+	last := len(haystack) - len(needle)
+	for start := 0; start <= last; start++ {
+		if lowerByte(haystack[start]) != first {
+			continue
+		}
+		match := true
+		for offset := 1; offset < len(needle); offset++ {
+			if lowerByte(haystack[start+offset]) != needle[offset] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 func detectFramework(stated string, body []byte) string {
 	rows := [][3]string{
 		{"wordpress", "wp-content", "WordPress"},
@@ -406,25 +473,22 @@ func detectFramework(stated string, body []byte) string {
 				return row[2]
 			}
 		}
-		if index := strings.Index(stated, " "); index > 0 {
-			return stated[:index]
+		if name := generatorName(stated); name != "" {
+			return name
 		}
-		return stated
 	}
-	lower := strings.ToLower(string(body))
 	for _, row := range rows {
 		fingerprint := row[1]
 		if fingerprint == "" {
 			fingerprint = row[0]
 		}
-		if strings.Contains(lower, fingerprint) {
+		if containsFold(body, fingerprint) {
 			return row[2]
 		}
 	}
 	return ""
 }
 
-// 站点地图抽取
 func ParseSitemap(body []byte) []string {
 	var document struct {
 		URLs []struct {
@@ -446,7 +510,6 @@ func ParseSitemap(body []byte) []string {
 	return locations
 }
 
-// 简易订阅报文
 type RssDoc struct {
 	Channel struct {
 		Title    string `xml:"title"`
@@ -458,7 +521,6 @@ type RssDoc struct {
 	} `xml:"channel"`
 }
 
-// 聚合订阅报文
 type AtomDoc struct {
 	XMLName  xml.Name `xml:"feed"`
 	Title    string   `xml:"title"`
@@ -470,7 +532,6 @@ type AtomDoc struct {
 	} `xml:"entry"`
 }
 
-// 字典订阅报文
 type JsonDoc struct {
 	Title string `json:"title"`
 	Items []struct {
@@ -480,7 +541,23 @@ type JsonDoc struct {
 	} `json:"items"`
 }
 
-// 抽取订阅字段
+func closeTruncated(body []byte) []byte {
+	for _, row := range [][2]string{{"</item>", "</channel></rss>"}, {"</entry>", "</feed>"}} {
+		index := bytes.LastIndex(body, []byte(row[0]))
+		if index > 0 {
+			return append(append([]byte{}, body[:index+len(row[0])]...), row[1]...)
+		}
+	}
+	return body
+}
+
+func decodeFeed(body []byte, target any) error {
+	if failure := xml.Unmarshal(body, target); failure == nil {
+		return nil
+	}
+	return xml.Unmarshal(closeTruncated(body), target)
+}
+
 func ParseSubscription(body []byte) Subscription {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -493,7 +570,7 @@ func ParseSubscription(body []byte) Subscription {
 		if json.Unmarshal(trimmed, &decoded) != nil {
 			return Subscription{}
 		}
-		subscription = Subscription{Parsed: true, Name: collapse(decoded.Title)}
+		subscription = Subscription{Parsed: true, Name: cleanTitle(decoded.Title)}
 		for _, item := range decoded.Items {
 			for _, person := range item.Authors {
 				subscription.addAuthor(person.Name)
@@ -501,20 +578,20 @@ func ParseSubscription(body []byte) Subscription {
 		}
 	case bytes.Contains(trimmed[:min(len(trimmed), 512)], []byte("<rss")):
 		var channel RssDoc
-		if xml.Unmarshal(trimmed, &channel) != nil {
+		if decodeFeed(trimmed, &channel) != nil {
 			return Subscription{}
 		}
-		subscription = Subscription{Parsed: true, Name: collapse(channel.Channel.Title), Language: normalizeLang(channel.Channel.Language)}
+		subscription = Subscription{Parsed: true, Name: cleanTitle(channel.Channel.Title), Language: normalizeLang(channel.Channel.Language)}
 		for _, item := range channel.Channel.Items {
 			subscription.addAuthor(item.Creator)
 			subscription.addAuthor(item.Author)
 		}
 	default:
 		var document AtomDoc
-		if xml.Unmarshal(trimmed, &document) != nil {
+		if decodeFeed(trimmed, &document) != nil {
 			return Subscription{}
 		}
-		subscription = Subscription{Parsed: true, Name: collapse(document.Title), Language: normalizeLang(document.Language)}
+		subscription = Subscription{Parsed: true, Name: cleanTitle(document.Title), Language: normalizeLang(document.Language)}
 		for _, entry := range document.Entries {
 			for _, person := range entry.Authors {
 				subscription.addAuthor(person.Name)
@@ -524,10 +601,9 @@ func ParseSubscription(body []byte) Subscription {
 	return subscription
 }
 
-// 去重收作者
 func (subscription *Subscription) addAuthor(author string) {
 	word := collapse(author)
-	if isPlaceholder(word) {
+	if isPlaceholder(word) || isContact(word) {
 		return
 	}
 	for _, existing := range subscription.Authors {

@@ -58,7 +58,7 @@ def is_address(word):
 
 def encode_tags(value):
     if value is not None and not isinstance(value, list):
-        raise ValueError("标签非数组")
+        raise ValueError("Not List: %r" % value)
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     for code in (0x3c, 0x3e, 0x26, 0x2028, 0x2029):
         text = text.replace(chr(code), "\\u%04x" % code)
@@ -90,7 +90,7 @@ def write_rows(table, rows, stamp):
         for host, name, feed, tag in rows:
             cursor.execute("""INSERT INTO blog (host, state, create_at, check_at, name, feed, tag)
                 VALUES (?,?,?,?,?,?,?) ON CONFLICT(host) DO NOTHING""",
-                           (host, "seed", stamp, stamp, name, feed, tag))
+                           (host, "pend", stamp, stamp, name, feed, tag))
             if cursor.rowcount > 0:
                 inserted += 1
                 continue
@@ -127,13 +127,15 @@ def main():
         table.executescript("""
 CREATE TABLE IF NOT EXISTS blog (
  host      TEXT PRIMARY KEY,
- state     TEXT NOT NULL DEFAULT 'pend',
- name      TEXT NOT NULL DEFAULT '',
- author    TEXT NOT NULL DEFAULT '',
  feed      TEXT NOT NULL DEFAULT '',
  lang      TEXT NOT NULL DEFAULT '',
- framework TEXT NOT NULL DEFAULT '',
+ name      TEXT NOT NULL DEFAULT '',
+ author    TEXT NOT NULL DEFAULT '',
  tag       TEXT NOT NULL DEFAULT '',
+ friend    TEXT NOT NULL DEFAULT '',
+ framework TEXT NOT NULL DEFAULT '',
+ state     TEXT NOT NULL DEFAULT 'pend',
+ cert      INTEGER NOT NULL DEFAULT 0,
  create_at TEXT NOT NULL DEFAULT '',
  check_at  TEXT NOT NULL DEFAULT ''
 );

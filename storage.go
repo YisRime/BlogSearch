@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	_ "modernc.org/sqlite"
 	"os"
@@ -10,45 +11,17 @@ import (
 	"time"
 )
 
-const (
-	StateSeed  = "seed"
-	StatePend  = "pend"
-	StateRetry = "retry"
-	StateAlive = "alive"
-	StateDeny  = "deny"
-	StateDead  = "dead"
-)
-
-const schemaText = `
-CREATE TABLE IF NOT EXISTS blog (
- host      TEXT PRIMARY KEY,
- state     TEXT NOT NULL DEFAULT 'pend',
- name      TEXT NOT NULL DEFAULT '',
- author    TEXT NOT NULL DEFAULT '',
- feed      TEXT NOT NULL DEFAULT '',
- lang      TEXT NOT NULL DEFAULT '',
- framework TEXT NOT NULL DEFAULT '',
- tag       TEXT NOT NULL DEFAULT '',
- create_at TEXT NOT NULL DEFAULT '',
- check_at  TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS blog_queue ON blog (check_at, create_at);`
-
-var siteColumns = []string{"host", "state", "name", "author", "feed", "lang", "framework", "tag", "check_at"}
-
-const insertText = `INSERT INTO blog (host,state,name,author,feed,lang,framework,tag,check_at) VALUES (?,?,?,?,?,?,?,?,?)
-	ON CONFLICT(host) DO UPDATE SET state=excluded.state,name=excluded.name,author=excluded.author,
-	feed=excluded.feed,lang=excluded.lang,framework=excluded.framework,tag=excluded.tag,check_at=excluded.check_at`
-
 type Site struct {
 	Host      string
-	State     string
-	Name      string
-	Author    string
 	Feed      string
 	Language  string
-	Framework string
+	Name      string
+	Author    string
 	Tags      string
+	Friend    string
+	Framework string
+	State     string
+	Cert      bool
 	CheckAt   string
 }
 
@@ -67,11 +40,30 @@ func OpenBlogTable(path string) (*BlogTable, error) {
 	if failure != nil {
 		return nil, failure
 	}
-	if _, failure := connection.Exec(schemaText); failure != nil {
+	schema := `
+CREATE TABLE IF NOT EXISTS blog (
+ host      TEXT PRIMARY KEY,
+ feed      TEXT NOT NULL DEFAULT '',
+ lang      TEXT NOT NULL DEFAULT '',
+ name      TEXT NOT NULL DEFAULT '',
+ author    TEXT NOT NULL DEFAULT '',
+ tag       TEXT NOT NULL DEFAULT '',
+ friend    TEXT NOT NULL DEFAULT '',
+ framework TEXT NOT NULL DEFAULT '',
+ state     TEXT NOT NULL DEFAULT 'pend',
+ cert      INTEGER NOT NULL DEFAULT 0,
+ create_at TEXT NOT NULL DEFAULT '',
+ check_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS blog_queue ON blog (check_at, create_at);`
+	if _, failure := connection.Exec(schema); failure != nil {
 		connection.Close()
 		return nil, failure
 	}
-	write, failure := connection.Prepare(insertText)
+	write, failure := connection.Prepare(`INSERT INTO blog (host,feed,lang,name,author,tag,friend,framework,state,cert,check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(host) DO UPDATE SET feed=excluded.feed,lang=excluded.lang,name=excluded.name,author=excluded.author,
+	tag=excluded.tag,friend=excluded.friend,framework=excluded.framework,state=excluded.state,cert=excluded.cert,
+	check_at=excluded.check_at`)
 	if failure != nil {
 		connection.Close()
 		return nil, failure
@@ -106,7 +98,7 @@ func (table *BlogTable) Enqueue(hosts []string, now time.Time) (inserted int) {
 		if host == "" {
 			continue
 		}
-		handle, failure = statement.Exec(host, StatePend, stamp, stamp)
+		handle, failure = statement.Exec(host, "pend", stamp, stamp)
 		if failure != nil {
 			return
 		}
@@ -123,9 +115,18 @@ func (table *BlogTable) Enqueue(hosts []string, now time.Time) (inserted int) {
 	return
 }
 
-func (table *BlogTable) Dequeue(now time.Time) ([]Site, error) {
-	rows, failure := table.database.Query(`SELECT `+strings.Join(siteColumns, `,`)+` FROM blog
-		WHERE check_at<>'' AND check_at<=? ORDER BY create_at ASC`, now.Format(time.RFC3339))
+func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site, error) {
+	query := `SELECT host,feed,lang,name,author,tag,friend,framework,state,cert,check_at FROM blog
+		WHERE check_at<>'' AND check_at<=?`
+	arguments := []any{now.Format(time.RFC3339)}
+	if len(busy) > 0 {
+		query += ` AND host NOT IN (?` + strings.Repeat(",?", len(busy)-1) + `)`
+		for _, host := range busy {
+			arguments = append(arguments, host)
+		}
+	}
+	rows, failure := table.database.Query(query+` ORDER BY create_at ASC LIMIT ?`,
+		append(arguments, batch)...)
 	if failure != nil {
 		return nil, failure
 	}
@@ -133,13 +134,88 @@ func (table *BlogTable) Dequeue(now time.Time) ([]Site, error) {
 	var sites []Site
 	for rows.Next() {
 		site := Site{}
-		if failure := rows.Scan(&site.Host, &site.State, &site.Name, &site.Author, &site.Feed, &site.Language,
-			&site.Framework, &site.Tags, &site.CheckAt); failure != nil {
+		var cert int
+		if failure := rows.Scan(&site.Host, &site.Feed, &site.Language, &site.Name, &site.Author, &site.Tags,
+			&site.Friend, &site.Framework, &site.State, &cert, &site.CheckAt); failure != nil {
 			return nil, failure
 		}
+		site.Cert = cert != 0
 		sites = append(sites, site)
 	}
 	return sites, rows.Err()
+}
+
+func (table *BlogTable) NextDue(now time.Time) time.Duration {
+	var text sql.NullString
+	failure := table.database.QueryRow(`SELECT MIN(check_at) FROM blog WHERE check_at<>'' AND check_at>?`,
+		now.Format(time.RFC3339)).Scan(&text)
+	if failure != nil || !text.Valid {
+		return 5 * time.Minute
+	}
+	when, failure := time.Parse(time.RFC3339, text.String)
+	if failure != nil {
+		return 5 * time.Minute
+	}
+	delay := time.Until(when)
+	if delay < time.Second {
+		delay = time.Second
+	}
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	return delay
+}
+
+func (table *BlogTable) FriendOrdinals(hosts []string) string {
+	seen := map[string]bool{}
+	keys := make([]string, 0, len(hosts))
+	for _, raw := range hosts {
+		host := Judge(raw)
+		if host == "" || seen[host] {
+			continue
+		}
+		seen[host] = true
+		keys = append(keys, host)
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	arguments := make([]any, len(keys))
+	for index, host := range keys {
+		arguments[index] = host
+	}
+	rows, failure := table.database.Query(`SELECT host,rowid FROM blog WHERE host IN (?`+
+		strings.Repeat(",?", len(keys)-1)+`)`, arguments...)
+	if failure != nil {
+		return ""
+	}
+	defer rows.Close()
+	ordinals := map[string]int64{}
+	for rows.Next() {
+		var host string
+		var id int64
+		if failure := rows.Scan(&host, &id); failure != nil {
+			return ""
+		}
+		ordinals[host] = id
+	}
+	if rows.Err() != nil {
+		return ""
+	}
+	ids := make([]int64, 0, len(keys))
+	for _, host := range keys {
+		if id, ok := ordinals[host]; ok {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	text, failure := json.Marshal(ids)
+	if failure != nil {
+		return ""
+	}
+	return string(text)
 }
 
 func (table *BlogTable) Save(site *Site, outcome Outcome) {
@@ -151,15 +227,16 @@ func (table *BlogTable) Save(site *Site, outcome Outcome) {
 		}
 	}
 	switch outcome.State {
-	case StateAlive:
+	case "alive":
 		site.State = outcome.State
 		keep(&site.Name, outcome.Name)
 		keep(&site.Author, outcome.Author)
 		keep(&site.Feed, outcome.Feed)
 		keep(&site.Language, outcome.Language)
 		keep(&site.Framework, outcome.Framework)
+		keep(&site.Friend, outcome.Friend)
 		schedule(30 * 24 * time.Hour)
-	case StateDeny, StateDead:
+	case "dead":
 		site.State, site.CheckAt = outcome.State, ""
 	default:
 		if outcome.Local {
@@ -167,15 +244,16 @@ func (table *BlogTable) Save(site *Site, outcome Outcome) {
 			break
 		}
 		switch site.State {
-		case StateSeed, StatePend, StateAlive:
-			site.State = StateRetry
+		case "pend", "alive":
+			site.State = "retry"
 			schedule(24 * time.Hour)
 		default:
-			site.State, site.CheckAt = StateDead, ""
+			site.State, site.CheckAt = "dead", ""
 		}
 	}
-	_, failure := table.write.Exec(site.Host, site.State, site.Name, site.Author, site.Feed,
-		site.Language, site.Framework, site.Tags, site.CheckAt)
+	site.Cert = site.Cert || outcome.Cert
+	_, failure := table.write.Exec(site.Host, site.Feed, site.Language, site.Name, site.Author, site.Tags,
+		site.Friend, site.Framework, site.State, site.Cert, site.CheckAt)
 	if failure != nil {
 		fmt.Fprintf(os.Stderr, "写入 %s 失败：%v\n", site.Host, failure)
 	}
