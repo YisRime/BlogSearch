@@ -36,10 +36,15 @@ func OpenBlogTable(path string) (*BlogTable, error) {
 			return nil, failure
 		}
 	}
-	connection, failure := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	connection, failure := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)",
+		path, (5*time.Second).Milliseconds()))
 	if failure != nil {
 		return nil, failure
 	}
+	connection.SetMaxOpenConns(16)
+	connection.SetMaxIdleConns(16)
+	connection.SetConnMaxIdleTime(5 * time.Minute)
+	connection.SetConnMaxLifetime(60 * time.Minute)
 	schema := `
 CREATE TABLE IF NOT EXISTS blog (
  host      TEXT PRIMARY KEY,
@@ -125,7 +130,7 @@ func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site
 			arguments = append(arguments, host)
 		}
 	}
-	rows, failure := table.database.Query(query+` ORDER BY create_at ASC LIMIT ?`,
+	rows, failure := table.database.Query(query+` ORDER BY check_at ASC LIMIT ?`,
 		append(arguments, batch)...)
 	if failure != nil {
 		return nil, failure
@@ -157,8 +162,8 @@ func (table *BlogTable) NextDue(now time.Time) time.Duration {
 		return 5 * time.Minute
 	}
 	delay := time.Until(when)
-	if delay < time.Second {
-		delay = time.Second
+	if delay < 5*time.Second {
+		delay = 5 * time.Second
 	}
 	if delay > 5*time.Minute {
 		delay = 5 * time.Minute

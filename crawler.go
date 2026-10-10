@@ -32,6 +32,7 @@ type Outcome struct {
 	Friends   []string
 	Friend    string
 	Requests  int
+	Timeouts  int
 	Bytes     int
 	Latency   time.Duration
 	Cert      bool
@@ -47,6 +48,7 @@ type BatchTally struct {
 	Requests int
 	Bytes    int
 	Expanded int
+	Timeouts int
 	Latency  time.Duration
 }
 
@@ -55,6 +57,7 @@ func (tally *BatchTally) add(outcome Outcome, inserted int) {
 	tally.Requests += outcome.Requests
 	tally.Bytes += outcome.Bytes
 	tally.Expanded += inserted
+	tally.Timeouts += outcome.Timeouts
 	tally.Latency += outcome.Latency
 }
 
@@ -63,30 +66,93 @@ type Crawler struct {
 	follower    *http.Client
 	loose       *http.Client
 	looseFollow *http.Client
+
+	guard   sync.Mutex
+	latency float64
+	learned map[string]string
 }
 
-func newTransport(relaxed bool) *http.Transport {
+func newTransport(relaxed bool, maxConns, perHost int) *http.Transport {
 	return &http.Transport{
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		TLSHandshakeTimeout: 5 * time.Second,
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS11, InsecureSkipVerify: relaxed},
-		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 16,
+		MaxIdleConns:        maxConns,
+		MaxIdleConnsPerHost: perHost,
 		IdleConnTimeout:     30 * time.Second,
 		ForceAttemptHTTP2:   true,
 	}
 }
 
 func NewCrawler() *Crawler {
-	strict, relaxed := newTransport(false), newTransport(true)
+	floor := runtime.GOMAXPROCS(0)
+	ceiling := floor * 4
+	strict, relaxed := newTransport(false, ceiling, floor), newTransport(true, ceiling, floor)
 	hold := func(transport *http.Transport) *http.Client {
-		return &http.Client{Transport: transport, Timeout: 30 * time.Second,
+		return &http.Client{Transport: transport, Timeout: 60 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	pass := func(transport *http.Transport) *http.Client {
-		return &http.Client{Transport: transport, Timeout: 30 * time.Second}
+		return &http.Client{Transport: transport, Timeout: 60 * time.Second}
 	}
-	return &Crawler{client: hold(strict), follower: pass(strict), loose: hold(relaxed), looseFollow: pass(relaxed)}
+	return &Crawler{
+		client: hold(strict), follower: pass(strict), loose: hold(relaxed), looseFollow: pass(relaxed),
+		latency: 4, learned: map[string]string{},
+	}
+}
+
+func (crawler *Crawler) Timeout() time.Duration {
+	crawler.guard.Lock()
+	latency := crawler.latency
+	crawler.guard.Unlock()
+	if latency <= 0 {
+		return 10 * time.Second
+	}
+	timeout := time.Duration(4 * latency * float64(time.Second))
+	if timeout < 10*time.Second {
+		return 10 * time.Second
+	}
+	if timeout > 60*time.Second {
+		return 60 * time.Second
+	}
+	return timeout
+}
+
+func (crawler *Crawler) observe(elapsed time.Duration) {
+	sample := elapsed.Seconds()
+	crawler.guard.Lock()
+	crawler.latency += (sample - crawler.latency) * 0.1
+	crawler.guard.Unlock()
+}
+
+func (crawler *Crawler) recall(key string) string {
+	crawler.guard.Lock()
+	defer crawler.guard.Unlock()
+	return crawler.learned[key]
+}
+
+func (crawler *Crawler) memorize(key, target string) {
+	parsed, failure := url.Parse(target)
+	if failure != nil || parsed.Path == "" {
+		return
+	}
+	crawler.guard.Lock()
+	crawler.learned[key] = parsed.Path
+	crawler.guard.Unlock()
+}
+
+func timedOut(failure error) bool {
+	if failure == nil {
+		return false
+	}
+	if errors.Is(failure, context.DeadlineExceeded) {
+		return true
+	}
+	text := failure.Error()
+	return strings.Contains(text, "i/o timeout") ||
+		strings.Contains(text, "handshake timeout") ||
+		strings.Contains(text, "Client.Timeout") ||
+		strings.Contains(text, "context deadline exceeded")
 }
 
 func (crawler *Crawler) fetch(task context.Context, target string, follow, relaxed bool) (*PageReply, error) {
@@ -118,8 +184,14 @@ func (crawler *Crawler) fetch(task context.Context, target string, follow, relax
 func (crawler *Crawler) attempt(task context.Context, outcome *Outcome, target string, follow, relaxed bool) (*PageReply, error) {
 	started := time.Now()
 	reply, failure := crawler.fetch(task, target, follow, relaxed)
+	elapsed := time.Since(started)
 	outcome.Requests++
-	outcome.Latency += time.Since(started)
+	outcome.Latency += elapsed
+	if failure == nil {
+		crawler.observe(elapsed)
+	} else if timedOut(failure) {
+		outcome.Timeouts++
+	}
 	return reply, failure
 }
 
@@ -233,7 +305,7 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 	target := "https://" + site.Host + "/"
 	tried := map[string]bool{target: true}
 	var reply *PageReply
-	for hop := 0; hop <= 2; hop++ {
+	for hop := 0; hop <= 4; hop++ {
 		wanted := target
 		var failure error
 		reply, target, failure = crawler.fetchEither(task, outcome, target, false)
@@ -267,7 +339,7 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 			outcome.State, outcome.Links = "alive", collector.items
 			return Page{}, false
 		}
-		if hop < 2 {
+		if hop < 4 {
 			target = next
 			continue
 		}
@@ -304,6 +376,69 @@ func (crawler *Crawler) expand(task context.Context, site *Site, page Page, outc
 	}
 }
 
+func (crawler *Crawler) subscribe(task context.Context, site *Site, page Page, outcome *Outcome) {
+	key := page.Framework
+	if key == "" {
+		key = "default"
+	}
+	candidates := make([]string, 0, len(feedPaths)+3)
+	if site.Feed != "" {
+		candidates = append(candidates, site.Feed)
+	}
+	if recalled := crawler.recall("feed:" + key); recalled != "" {
+		candidates = append(candidates, "https://"+site.Host+recalled)
+	}
+	switch {
+	case page.Feed == "":
+		candidates = append(candidates, pathsOn(site.Host, feedPaths)...)
+	case page.Feed != site.Feed:
+		candidates = append(candidates, page.Feed)
+	}
+	reason := ""
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		reply, target, failure := crawler.fetchEither(task, outcome, candidate, true)
+		if failure != nil {
+			if reason == "" {
+				reason = failure.Error()
+			}
+			continue
+		}
+		if reply.Status != http.StatusOK {
+			if reason == "" {
+				reason = strconv.Itoa(reply.Status)
+			}
+			if page.Feed != "" {
+				break
+			}
+			continue
+		}
+		outcome.Bytes += len(reply.Body)
+		subscription := ParseSubscription(reply.Body)
+		if !subscription.Parsed {
+			continue
+		}
+		outcome.Feed = target
+		crawler.memorize("feed:"+key, target)
+		reason = ""
+		if subscription.Name != "" {
+			outcome.Name = subscription.Name
+		}
+		if len(subscription.Authors) == 1 {
+			outcome.Author = subscription.Authors[0]
+		}
+		if subscription.Language != "" {
+			outcome.Language = subscription.Language
+		}
+		break
+	}
+	if reason != "" {
+		fail(outcome, "alive", "订阅失败", reason)
+	}
+}
+
 func (crawler *Crawler) Crawl(task context.Context, site *Site, full bool) Outcome {
 	outcome := Outcome{State: "alive"}
 	collector := &collector{seen: map[string]bool{site.Host: true}}
@@ -313,50 +448,16 @@ func (crawler *Crawler) Crawl(task context.Context, site *Site, full bool) Outco
 		return outcome
 	}
 	if full {
-		candidates := []string{site.Feed}
-		switch {
-		case page.Feed == "":
-			candidates = append(candidates, pathsOn(site.Host, feedPaths)...)
-		case page.Feed != site.Feed:
-			candidates = append(candidates, page.Feed)
+		crawler.subscribe(task, site, page, &outcome)
+		candidates := pathsOn(site.Host, sitemapPaths)
+		if recalled := crawler.recall("sitemap"); recalled != "" {
+			candidates = append([]string{"https://" + site.Host + recalled}, candidates...)
 		}
-		for _, candidate := range candidates {
-			if candidate == "" {
-				continue
-			}
-			reply, target, failure := crawler.fetchEither(task, &outcome, candidate, true)
-			if failure != nil {
-				fail(&outcome, "alive", "订阅失败", failure.Error())
-				continue
-			}
-			if reply.Status != http.StatusOK {
-				if page.Feed != "" {
-					fail(&outcome, "alive", "订阅失败", strconv.Itoa(reply.Status))
-					break
-				}
-				continue
-			}
-			outcome.Bytes += len(reply.Body)
-			subscription := ParseSubscription(reply.Body)
-			if !subscription.Parsed {
-				continue
-			}
-			outcome.Feed = target
-			if subscription.Name != "" {
-				outcome.Name = subscription.Name
-			}
-			if len(subscription.Authors) == 1 {
-				outcome.Author = subscription.Authors[0]
-			}
-			if subscription.Language != "" {
-				outcome.Language = subscription.Language
-			}
-			break
-		}
-		if reply, _ := crawler.probe(task, &outcome, pathsOn(site.Host, sitemapPaths)); reply != nil {
+		if reply, target := crawler.probe(task, &outcome, candidates); reply != nil {
 			for _, link := range ParseSitemap(reply.Body) {
 				collector.add(link)
 			}
+			crawler.memorize("sitemap", target)
 		}
 	}
 	crawler.expand(task, site, page, &outcome, registrable, collector)
@@ -367,174 +468,180 @@ func (crawler *Crawler) Crawl(task context.Context, site *Site, full bool) Outco
 type tuner struct {
 	guard   sync.Mutex
 	worker  int32
-	rate    float64
-	latency time.Duration
+	floor   int32
+	ceiling int32
 }
 
 func newTuner() *tuner {
-	return &tuner{worker: int32(runtime.GOMAXPROCS(0))}
+	floor := int32(runtime.GOMAXPROCS(0))
+	return &tuner{worker: floor, floor: floor, ceiling: floor * 4}
 }
-
-func (tuner *tuner) batch() int { return int(atomic.LoadInt32(&tuner.worker)) }
 
 func (tuner *tuner) workers() int { return int(atomic.LoadInt32(&tuner.worker)) }
 
-func (tuner *tuner) tune(count BatchTally, elapsed time.Duration) {
-	if count.Requests == 0 || elapsed <= 0 {
+func (tuner *tuner) cap() int { return int(atomic.LoadInt32(&tuner.ceiling)) }
+
+func (tuner *tuner) tune(count BatchTally) {
+	if count.Requests == 0 {
 		return
 	}
 	tuner.guard.Lock()
 	defer tuner.guard.Unlock()
 	worker := int(atomic.LoadInt32(&tuner.worker))
-	if worker < 1 {
-		worker = 1
+	floor, ceiling := int(tuner.floor), int(tuner.ceiling)
+	ratio := float64(count.Timeouts) / float64(count.Requests)
+	switch {
+	case ratio > 0.10:
+		worker /= 2
+	case ratio < 0.05:
+		worker += 4
 	}
-	rate := float64(count.Sites) / elapsed.Seconds()
-	mean := count.Latency / time.Duration(count.Requests)
-	if tuner.rate > 0 {
-		better := rate > tuner.rate*105/100
-		worse := mean > tuner.latency*120/100
-		switch {
-		case better && !worse:
-			worker++
-		case worse:
-			worker /= 2
-			if worker < 1 {
-				worker = 1
-			}
-		}
+	if worker < floor {
+		worker = floor
+	}
+	if worker > ceiling {
+		worker = ceiling
 	}
 	atomic.StoreInt32(&tuner.worker, int32(worker))
-	tuner.rate, tuner.latency = rate, mean
+}
+
+type completed struct {
+	site     Site
+	outcome  Outcome
+	inserted int
+}
+
+func takeWindow(tally *BatchTally, guard *sync.Mutex) BatchTally {
+	guard.Lock()
+	snapshot := *tally
+	*tally = BatchTally{}
+	guard.Unlock()
+	return snapshot
 }
 
 func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) error {
 	knob := newTuner()
-	jobs := make(chan Site, runtime.GOMAXPROCS(0))
-	live := int32(0)
-	var group sync.WaitGroup
-	var guard sync.Mutex
-	var window BatchTally
-	var cycle BatchTally
-	cycleMark := time.Now()
+	capacity := knob.cap()
+	jobs := make(chan Site, capacity)
+	results := make(chan completed, capacity)
 	inflight := map[string]bool{}
+	var guard sync.Mutex
 
-	var consume func()
-	var fill func()
-
-	group.Add(1)
-	go func() {
-		defer group.Done()
-		defer close(jobs)
-		for task.Err() == nil {
-			guard.Lock()
-			busy := make([]string, 0, len(inflight))
-			for host := range inflight {
-				busy = append(busy, host)
+	var pool sync.WaitGroup
+	for index := 0; index < capacity; index++ {
+		pool.Add(1)
+		go func() {
+			defer pool.Done()
+			for site := range jobs {
+				siteCtx, cancel := context.WithTimeout(task, crawler.Timeout())
+				outcome := crawler.Crawl(siteCtx, &site, site.State != "alive")
+				cancel()
+				results <- completed{site: site, outcome: outcome}
 			}
-			guard.Unlock()
-			batch, failure := table.Dequeue(time.Now().UTC(), knob.batch(), busy)
+		}()
+	}
+
+	tuneTicker := time.NewTicker(5 * time.Second)
+	defer tuneTicker.Stop()
+	reportTicker := time.NewTicker(5 * time.Minute)
+	defer reportTicker.Stop()
+
+	var window, cycle BatchTally
+	mark, round := time.Now(), 1
+
+	handle := func(done completed) {
+		if done.outcome.State == "alive" {
+			done.inserted = table.Enqueue(done.outcome.Links, time.Now().UTC())
+			if len(done.outcome.Friends) > 0 {
+				done.outcome.Friend = table.FriendOrdinals(done.outcome.Friends)
+			}
+		}
+		table.Save(&done.site, done.outcome)
+		guard.Lock()
+		delete(inflight, done.site.Host)
+		window.add(done.outcome, done.inserted)
+		cycle.add(done.outcome, done.inserted)
+		guard.Unlock()
+		at := time.Now().Format(time.RFC3339)
+		if done.outcome.Reason != "" {
+			fmt.Printf("%s [%s] %s %s\n", at, done.site.State, done.site.Host, done.outcome.Reason)
+		} else {
+			fmt.Printf("%s [%s] %s %s\n", at, done.site.State, done.site.Host, gathered(&done.site))
+		}
+	}
+
+	running := true
+	for running && task.Err() == nil {
+		guard.Lock()
+		pending := len(inflight)
+		busy := make([]string, 0, pending)
+		for host := range inflight {
+			busy = append(busy, host)
+		}
+		guard.Unlock()
+
+		if want := knob.workers() - pending; want > 0 {
+			batch, failure := table.Dequeue(time.Now().UTC(), want, busy)
 			if failure != nil {
-				fmt.Fprintf(os.Stderr, "取到期站点失败：%v\n", failure)
-				return
+				fmt.Fprintf(os.Stderr, "取站失败：%v\n", failure)
+				break
 			}
 			if len(batch) == 0 {
-				hold(task, table.NextDue(time.Now().UTC()))
+				timer := time.NewTimer(table.NextDue(time.Now().UTC()))
+				select {
+				case <-task.Done():
+					timer.Stop()
+					running = false
+				case <-timer.C:
+				case done := <-results:
+					timer.Stop()
+					handle(done)
+				case <-tuneTicker.C:
+					timer.Stop()
+					knob.tune(takeWindow(&cycle, &guard))
+				case <-reportTicker.C:
+					timer.Stop()
+					report(knob, &window, &guard, round, time.Since(mark))
+					mark, round = time.Now(), round+1
+				}
 				continue
 			}
 			for _, site := range batch {
 				guard.Lock()
 				inflight[site.Host] = true
 				guard.Unlock()
-				select {
-				case jobs <- site:
-				case <-task.Done():
-					return
-				}
+				jobs <- site
 			}
+			continue
 		}
-	}()
-
-	consume = func() {
-		defer group.Done()
-		defer atomic.AddInt32(&live, -1)
-		for site := range jobs {
-			if task.Err() != nil {
-				return
-			}
-			outcome := crawler.Crawl(task, &site, site.State != "alive")
-			inserted := 0
-			if outcome.State == "alive" {
-				inserted = table.Enqueue(outcome.Links, time.Now().UTC())
-				if len(outcome.Friends) > 0 {
-					outcome.Friend = table.FriendOrdinals(outcome.Friends)
-				}
-			}
-			table.Save(&site, outcome)
-			guard.Lock()
-			delete(inflight, site.Host)
-			window.add(outcome, inserted)
-			cycle.add(outcome, inserted)
-			ready := cycle.Sites >= knob.workers()
-			snapshot, elapsed := BatchTally{}, time.Duration(0)
-			if ready {
-				snapshot, elapsed = cycle, time.Since(cycleMark)
-				cycle, cycleMark = BatchTally{}, time.Now()
-			}
-			guard.Unlock()
-			at := time.Now().Format(time.RFC3339)
-			if outcome.Reason != "" {
-				fmt.Printf("%s [%s] %s %s\n", at, site.State, site.Host, outcome.Reason)
-			} else {
-				fmt.Printf("%s [%s] %s %s\n", at, site.State, site.Host, gathered(&site))
-			}
-			if ready {
-				knob.tune(snapshot, elapsed)
-				fill()
-			}
-			if int(atomic.LoadInt32(&live)) > knob.workers() {
-				return
-			}
+		select {
+		case <-task.Done():
+			running = false
+		case done := <-results:
+			handle(done)
+		case <-tuneTicker.C:
+			knob.tune(takeWindow(&cycle, &guard))
+		case <-reportTicker.C:
+			report(knob, &window, &guard, round, time.Since(mark))
+			mark, round = time.Now(), round+1
 		}
 	}
 
-	fill = func() {
-		for int(atomic.LoadInt32(&live)) < knob.workers() {
-			atomic.AddInt32(&live, 1)
-			group.Add(1)
-			go consume()
-		}
-	}
-
-	group.Add(1)
+	close(jobs)
+	drained := make(chan struct{})
 	go func() {
-		defer group.Done()
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		mark, round := time.Now(), 1
-		for {
-			select {
-			case <-task.Done():
-				report(knob, &window, &guard, round, time.Since(mark))
-				return
-			case now := <-ticker.C:
-				report(knob, &window, &guard, round, now.Sub(mark))
-				mark, round = now, round+1
-				fill()
-			}
+		for range results {
 		}
+		close(drained)
 	}()
-
-	fill()
-	group.Wait()
+	pool.Wait()
+	close(results)
+	<-drained
 	return nil
 }
 
 func report(knob *tuner, tally *BatchTally, guard *sync.Mutex, round int, elapsed time.Duration) {
-	guard.Lock()
-	count := *tally
-	*tally = BatchTally{}
-	guard.Unlock()
+	count := takeWindow(tally, guard)
 	if count.Sites == 0 {
 		return
 	}
@@ -560,13 +667,4 @@ func gathered(site *Site) string {
 		return ""
 	}
 	return "、" + strings.Join(parts, "、")
-}
-
-func hold(task context.Context, delay time.Duration) {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-task.Done():
-	case <-timer.C:
-	}
 }

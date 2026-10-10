@@ -66,7 +66,7 @@ def encode_tags(value):
 
 
 def fetch_text():
-    last = None
+    last = RuntimeError("下载失败")
     for attempt in range(3):
         try:
             request = urllib.request.Request(
@@ -117,7 +117,7 @@ def main():
                 continue
             seen.add(host)
             pairs.append((host, " ".join((item.get("name") or "").split()),
-                          (item.get("feed") or "").strip(), encode_tags(item.get("tags"))))
+                          (item.get("feed") or "").strip(), encode_tags(item.get("tags") or [])))
     except Exception as failure:
         report(failure)
         return 1

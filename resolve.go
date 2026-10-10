@@ -169,11 +169,11 @@ func collapse(text string) string {
 
 func normalizeLang(text string) string {
 	word := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(text), "_", "-"))
-	if word == "" || len([]rune(word)) > 20 {
+	if word == "" || len([]rune(word)) > 32 {
 		return ""
 	}
 	for _, part := range strings.Split(word, "-") {
-		if part == "" || len(part) > 8 || strings.Trim(part, "abcdefghijklmnopqrstuvwxyz0123456789") != "" {
+		if part == "" || len(part) > 16 || strings.Trim(part, "abcdefghijklmnopqrstuvwxyz0123456789") != "" {
 			return ""
 		}
 	}
@@ -184,14 +184,14 @@ func cleanTitle(text string) string {
 	name := collapse(text)
 	for _, cut := range []string{" - ", " _ ", " | ", " ｜ ", " · ", " — ", " – ", " » "} {
 		if index := strings.Index(name, cut); index > 0 {
-			if head := strings.TrimSpace(name[:index]); head != "" && len([]rune(head)) <= 30 {
+			if head := strings.TrimSpace(name[:index]); head != "" && len([]rune(head)) <= 32 {
 				name = head
 				break
 			}
 		}
 	}
-	if runes := []rune(name); len(runes) > 50 {
-		name = string(runes[:50])
+	if runes := []rune(name); len(runes) > 64 {
+		name = string(runes[:64])
 	}
 	return name
 }
@@ -325,10 +325,10 @@ func ParsePage(body []byte, origin string) Page {
 						hostname = normalizeHost(parsed.Host)
 						hostCache[parsed.Host] = hostname
 					}
-					if len(page.Links) < 200 {
+					if len(page.Links) < 208 {
 						page.Links = append(page.Links, hostname)
 					}
-					if len(page.Friends) < 10 && registrableOf(hostname) == originRegistrable {
+					if len(page.Friends) < 16 && registrableOf(hostname) == originRegistrable {
 						entry := strings.ToLower(nodeText(node) + " " + parsed.Path)
 						for _, word := range []string{"友链", "友情链接", "链接", "links", "friend", "blogroll"} {
 							if strings.Contains(entry, word) {
@@ -386,8 +386,8 @@ func copyrightName(text string) string {
 		}
 	}
 	runes := []rune(phrase)
-	if len(runes) < 2 || len(runes) > 40 || strings.ContainsAny(phrase, "0123456789") ||
-		len(strings.Fields(phrase)) > 4 || isPlaceholder(phrase) {
+	if len(runes) < 2 || len(runes) > 48 || strings.ContainsAny(phrase, "0123456789") ||
+		len(strings.Fields(phrase)) > 16 || isPlaceholder(phrase) {
 		return ""
 	}
 	return phrase
@@ -405,7 +405,7 @@ func generatorName(stated string) string {
 		fields = fields[:len(fields)-1]
 	}
 	word = collapse(strings.Join(fields, " "))
-	if word == "" || len([]rune(word)) > 30 {
+	if word == "" || len([]rune(word)) > 32 {
 		return ""
 	}
 	if strings.Contains(word, "'s ") || strings.Contains(word, "’s ") {
@@ -541,6 +541,19 @@ type JsonDoc struct {
 	} `json:"items"`
 }
 
+func feedHead(body []byte) []byte {
+	limit := len(body)
+	if limit > 512 {
+		limit = 512
+	}
+	for index := 0; index < limit; index++ {
+		if body[index] == '>' {
+			return body[:index+1]
+		}
+	}
+	return body[:limit]
+}
+
 func closeTruncated(body []byte) []byte {
 	for _, row := range [][2]string{{"</item>", "</channel></rss>"}, {"</entry>", "</feed>"}} {
 		index := bytes.LastIndex(body, []byte(row[0]))
@@ -576,7 +589,7 @@ func ParseSubscription(body []byte) Subscription {
 				subscription.addAuthor(person.Name)
 			}
 		}
-	case bytes.Contains(trimmed[:min(len(trimmed), 512)], []byte("<rss")):
+	case bytes.Contains(feedHead(trimmed), []byte("<rss")):
 		var channel RssDoc
 		if decodeFeed(trimmed, &channel) != nil {
 			return Subscription{}
