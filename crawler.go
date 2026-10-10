@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"golang.org/x/net/html/charset"
 	"io"
 	"net"
 	"net/http"
@@ -22,6 +24,8 @@ type PageReply struct {
 	Status   int
 	Body     []byte
 	Location string
+	Language string
+	CertEnd  time.Time
 }
 
 type Outcome struct {
@@ -36,11 +40,14 @@ type Outcome struct {
 	Bytes     int
 	Latency   time.Duration
 	Cert      bool
+	CertEnd   time.Time
 	Name      string
 	Author    string
 	Feed      string
 	Language  string
 	Framework string
+	ICP       string
+	Summary   string
 }
 
 type BatchTally struct {
@@ -155,6 +162,18 @@ func timedOut(failure error) bool {
 		strings.Contains(text, "context deadline exceeded")
 }
 
+func decodeBody(body []byte, contentType string) []byte {
+	reader, failure := charset.NewReader(bytes.NewReader(body), contentType)
+	if failure != nil {
+		return body
+	}
+	decoded, failure := io.ReadAll(reader)
+	if failure != nil || len(decoded) == 0 {
+		return body
+	}
+	return decoded
+}
+
 func (crawler *Crawler) fetch(task context.Context, target string, follow, relaxed bool) (*PageReply, error) {
 	client := crawler.client
 	switch {
@@ -177,8 +196,13 @@ func (crawler *Crawler) fetch(task context.Context, target string, follow, relax
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	return &PageReply{Status: response.StatusCode, Body: body,
-		Location: strings.TrimSpace(response.Header.Get("Location"))}, nil
+	reply := &PageReply{Status: response.StatusCode, Body: decodeBody(body, response.Header.Get("Content-Type")),
+		Location: strings.TrimSpace(response.Header.Get("Location")),
+		Language: strings.TrimSpace(response.Header.Get("Content-Language"))}
+	if response.TLS != nil && len(response.TLS.PeerCertificates) > 0 {
+		reply.CertEnd = response.TLS.PeerCertificates[0].NotAfter
+	}
+	return reply, nil
 }
 
 func (crawler *Crawler) attempt(task context.Context, outcome *Outcome, target string, follow, relaxed bool) (*PageReply, error) {
@@ -288,14 +312,17 @@ func (collector *collector) add(raw string) string {
 }
 
 func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome, registrable string, collector *collector) (Page, bool) {
-	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
-	if failure != nil {
+	dead := func(failure error) {
 		fail(outcome, "pend", "抓取失败", failure.Error())
 		if authoritative(failure) {
 			outcome.State, outcome.Reason = "dead", "地址无效"
 		} else {
 			outcome.Local = errors.As(failure, new(*net.DNSError))
 		}
+	}
+	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
+	if failure != nil {
+		dead(failure)
 		return Page{}, false
 	}
 	if len(addresses) == 0 {
@@ -311,15 +338,13 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 		reply, target, failure = crawler.fetchEither(task, outcome, target, false)
 		tried[wanted], tried[target] = true, true
 		if failure != nil {
-			fail(outcome, "pend", "抓取失败", failure.Error())
-			if authoritative(failure) {
-				outcome.State, outcome.Reason = "dead", "地址无效"
-			} else {
-				outcome.Local = errors.As(failure, new(*net.DNSError))
-			}
+			dead(failure)
 			return Page{}, false
 		}
 		outcome.Bytes += len(reply.Body)
+		if !reply.CertEnd.IsZero() {
+			outcome.CertEnd = reply.CertEnd
+		}
 		if reply.Status < 300 || reply.Status >= 400 {
 			break
 		}
@@ -336,7 +361,7 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 		}
 		collector.add(hostname)
 		if registrableOf(hostname) != registrable {
-			outcome.State, outcome.Links = "alive", collector.items
+			outcome.State, outcome.Links = "dead", collector.items
 			return Page{}, false
 		}
 		if hop < 4 {
@@ -355,10 +380,11 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 		fail(outcome, "pend", "应答失败", "200")
 		return Page{}, false
 	}
-	for _, link := range page.Links {
-		collector.add(link)
-	}
 	outcome.Name, outcome.Author, outcome.Language, outcome.Framework = page.Name, page.Author, page.Language, page.Framework
+	outcome.ICP, outcome.Summary = page.ICP, page.Summary
+	if outcome.Language == "" {
+		outcome.Language = reply.Language
+	}
 	return page, true
 }
 
@@ -550,11 +576,11 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 	mark, round := time.Now(), 1
 
 	handle := func(done completed) {
-		if done.outcome.State == "alive" {
+		if len(done.outcome.Links) > 0 {
 			done.inserted = table.Enqueue(done.outcome.Links, time.Now().UTC())
-			if len(done.outcome.Friends) > 0 {
-				done.outcome.Friend = table.FriendOrdinals(done.outcome.Friends)
-			}
+		}
+		if len(done.outcome.Friends) > 0 {
+			done.outcome.Friend = table.FriendOrdinals(done.outcome.Friends)
 		}
 		table.Save(&done.site, done.outcome)
 		guard.Lock()
@@ -563,11 +589,11 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 		cycle.add(done.outcome, done.inserted)
 		guard.Unlock()
 		at := time.Now().Format(time.RFC3339)
-		if done.outcome.Reason != "" {
-			fmt.Printf("%s [%s] %s %s\n", at, done.site.State, done.site.Host, done.outcome.Reason)
-		} else {
-			fmt.Printf("%s [%s] %s %s\n", at, done.site.State, done.site.Host, gathered(&done.site))
+		tail := done.outcome.Reason
+		if tail == "" {
+			tail = gathered(&done.site)
 		}
+		fmt.Printf("%s [%s] %s %s\n", at, done.site.State, done.site.Host, tail)
 	}
 
 	running := true

@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS blog (
  lang      TEXT NOT NULL DEFAULT '',
  name      TEXT NOT NULL DEFAULT '',
  author    TEXT NOT NULL DEFAULT '',
+ icp       TEXT NOT NULL DEFAULT '',
+ summary   TEXT NOT NULL DEFAULT '',
  tag       TEXT NOT NULL DEFAULT '',
  friend    TEXT NOT NULL DEFAULT '',
  framework TEXT NOT NULL DEFAULT '',

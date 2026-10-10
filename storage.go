@@ -17,6 +17,8 @@ type Site struct {
 	Language  string
 	Name      string
 	Author    string
+	ICP       string
+	Summary   string
 	Tags      string
 	Friend    string
 	Framework string
@@ -52,6 +54,8 @@ CREATE TABLE IF NOT EXISTS blog (
  lang      TEXT NOT NULL DEFAULT '',
  name      TEXT NOT NULL DEFAULT '',
  author    TEXT NOT NULL DEFAULT '',
+ icp       TEXT NOT NULL DEFAULT '',
+ summary   TEXT NOT NULL DEFAULT '',
  tag       TEXT NOT NULL DEFAULT '',
  friend    TEXT NOT NULL DEFAULT '',
  framework TEXT NOT NULL DEFAULT '',
@@ -65,10 +69,10 @@ CREATE INDEX IF NOT EXISTS blog_queue ON blog (check_at, create_at);`
 		connection.Close()
 		return nil, failure
 	}
-	write, failure := connection.Prepare(`INSERT INTO blog (host,feed,lang,name,author,tag,friend,framework,state,cert,check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+	write, failure := connection.Prepare(`INSERT INTO blog (host,feed,lang,name,author,icp,summary,tag,friend,framework,state,cert,check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(host) DO UPDATE SET feed=excluded.feed,lang=excluded.lang,name=excluded.name,author=excluded.author,
-	tag=excluded.tag,friend=excluded.friend,framework=excluded.framework,state=excluded.state,cert=excluded.cert,
-	check_at=excluded.check_at`)
+	icp=excluded.icp,summary=excluded.summary,tag=excluded.tag,friend=excluded.friend,framework=excluded.framework,
+	state=excluded.state,cert=excluded.cert,check_at=excluded.check_at`)
 	if failure != nil {
 		connection.Close()
 		return nil, failure
@@ -121,7 +125,7 @@ func (table *BlogTable) Enqueue(hosts []string, now time.Time) (inserted int) {
 }
 
 func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site, error) {
-	query := `SELECT host,feed,lang,name,author,tag,friend,framework,state,cert,check_at FROM blog
+	query := `SELECT host,feed,lang,name,author,icp,summary,tag,friend,framework,state,cert,check_at FROM blog
 		WHERE check_at<>'' AND check_at<=?`
 	arguments := []any{now.Format(time.RFC3339)}
 	if len(busy) > 0 {
@@ -140,8 +144,8 @@ func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site
 	for rows.Next() {
 		site := Site{}
 		var cert int
-		if failure := rows.Scan(&site.Host, &site.Feed, &site.Language, &site.Name, &site.Author, &site.Tags,
-			&site.Friend, &site.Framework, &site.State, &cert, &site.CheckAt); failure != nil {
+		if failure := rows.Scan(&site.Host, &site.Feed, &site.Language, &site.Name, &site.Author, &site.ICP,
+			&site.Summary, &site.Tags, &site.Friend, &site.Framework, &site.State, &cert, &site.CheckAt); failure != nil {
 			return nil, failure
 		}
 		site.Cert = cert != 0
@@ -239,8 +243,16 @@ func (table *BlogTable) Save(site *Site, outcome Outcome) {
 		keep(&site.Feed, outcome.Feed)
 		keep(&site.Language, outcome.Language)
 		keep(&site.Framework, outcome.Framework)
+		keep(&site.ICP, outcome.ICP)
+		keep(&site.Summary, outcome.Summary)
 		keep(&site.Friend, outcome.Friend)
-		schedule(30 * 24 * time.Hour)
+		delay := 30 * 24 * time.Hour
+		if !outcome.CertEnd.IsZero() {
+			if margin := outcome.CertEnd.Sub(now) - 3*24*time.Hour; margin > 0 && margin < delay {
+				delay = margin
+			}
+		}
+		schedule(delay)
 	case "dead":
 		site.State, site.CheckAt = outcome.State, ""
 	default:
@@ -257,8 +269,8 @@ func (table *BlogTable) Save(site *Site, outcome Outcome) {
 		}
 	}
 	site.Cert = site.Cert || outcome.Cert
-	_, failure := table.write.Exec(site.Host, site.Feed, site.Language, site.Name, site.Author, site.Tags,
-		site.Friend, site.Framework, site.State, site.Cert, site.CheckAt)
+	_, failure := table.write.Exec(site.Host, site.Feed, site.Language, site.Name, site.Author, site.ICP,
+		site.Summary, site.Tags, site.Friend, site.Framework, site.State, site.Cert, site.CheckAt)
 	if failure != nil {
 		fmt.Fprintf(os.Stderr, "写入 %s 失败：%v\n", site.Host, failure)
 	}
