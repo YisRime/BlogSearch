@@ -10,24 +10,32 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
+	"unicode/utf8"
 )
+
+func truncateRunes(text string, limit int) string {
+	if utf8.RuneCountInString(text) > limit {
+		return string([]rune(text)[:limit])
+	}
+	return text
+}
 
 func vagueName(text string) bool {
 	word := collapse(text)
-	runes := []rune(word)
-	if len(runes) < 2 || len(runes) > 40 {
-		return true
-	}
-	if strings.ContainsAny(word, "0123456789@©") || strings.Contains(word, "://") {
-		return true
-	}
-	return len(strings.Fields(word)) > 6
+	size := utf8.RuneCountInString(word)
+	return size < 2 || size > 40 || strings.ContainsAny(word, "0123456789@©") ||
+		strings.Contains(word, "://") || len(strings.Fields(word)) > 6
 }
 
-func sameName(text, other string) bool {
-	word := strings.ToLower(collapse(text))
-	return word != "" && word == strings.ToLower(collapse(other))
+func plausible(text string, refs ...string) bool {
+	word := collapse(text)
+	if word == "" || vagueName(word) {
+		return false
+	}
+	lower := strings.ToLower(word)
+	return !slices.ContainsFunc(refs, func(ref string) bool { return lower == strings.ToLower(collapse(ref)) })
 }
 
 func normalizeHost(raw string) string {
@@ -83,12 +91,25 @@ func registrableOf(host string) string {
 	return strings.Join(labels[len(labels)-suffixLabels-1:], ".")
 }
 
-func Judge(raw string) string {
+func HostOf(raw string) string {
 	host := normalizeHost(raw)
 	if host == "" {
 		return ""
 	}
 	if _, failure := netip.ParseAddr(host); failure == nil {
+		return ""
+	}
+	for _, suffix := range []string{".gov", ".mil"} {
+		if strings.HasSuffix(host, suffix) || strings.Contains(host, suffix+".") {
+			return ""
+		}
+	}
+	return host
+}
+
+func Judge(raw string) string {
+	host := HostOf(raw)
+	if host == "" {
 		return ""
 	}
 	registrable := registrableOf(host)
@@ -102,15 +123,17 @@ func Judge(raw string) string {
 }
 
 type Page struct {
-	Name      string
-	Author    string
-	Framework string
-	Language  string
-	Feed      string
-	ICP       string
-	Summary   string
-	Links     []string
-	Friends   []string
+	Name       string
+	Author     string
+	Framework  string
+	Language   string
+	Feed       string
+	ICP        string
+	Summary    string
+	Links      []string
+	Friends    []string
+	HasArchive bool
+	SinglePost bool
 }
 
 type Subscription struct {
@@ -120,11 +143,9 @@ type Subscription struct {
 	Language string
 }
 
-var friendPaths = []string{"/links", "/friends"}
-
-var copyrightPattern = regexp.MustCompile(`(?i)(?:©|\(c\)|copyright)\s*(?:\d{4}(?:\s*[-–~至]\s*\d{4})?)?\s*`)
-
-var icpPattern = regexp.MustCompile(`[\p{Han}]?ICP备\d+号|公网安备\d+号`)
+type named struct {
+	Name string `json:"name" xml:"name"`
+}
 
 func collapse(text string) string {
 	return strings.Join(strings.Fields(text), " ")
@@ -145,47 +166,60 @@ func normalizeLang(text string) string {
 
 func cleanTitle(text string) string {
 	name := collapse(text)
-	if index := firstSeparatorIndex(name); index > 0 {
-		if head := strings.TrimSpace(name[:index]); head != "" && len([]rune(head)) <= 32 {
-			name = head
-		}
+	if head := strings.TrimSpace(name[:firstSeparatorIndex(name)]); head != "" && utf8.RuneCountInString(head) <= 32 {
+		name = head
 	}
-	if runes := []rune(name); len(runes) > 64 {
-		name = string(runes[:64])
-	}
-	return name
+	return truncateRunes(name, 64)
 }
 
 func firstSeparatorIndex(name string) int {
 	offset := 0
 	for _, field := range strings.Fields(name) {
-		position := strings.Index(name[offset:], field)
-		if position < 0 {
-			break
-		}
-		position += offset
+		position := strings.Index(name[offset:], field) + offset
 		offset = position + len(field)
-		if position > 0 && len([]rune(field)) <= 2 && strings.Trim(field, "-–—_|｜/·»•・~") == "" {
+		if position > 0 && utf8.RuneCountInString(field) <= 2 && strings.Trim(field, "-–—_|｜/·»•・~") == "" {
 			return position
 		}
 	}
-	if index := strings.IndexAny(name, "｜·»•・"); index > 0 {
-		return index
-	}
-	return 0
+	return max(strings.IndexAny(name, "｜·»•・"), 0)
 }
 
-func isContact(text string) bool {
-	return strings.Contains(text, "@") || strings.Contains(text, "://")
+func jsonAuthorName(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil && text != "" {
+		return text
+	}
+	var one named
+	if json.Unmarshal(raw, &one) == nil && one.Name != "" {
+		return one.Name
+	}
+	var many []named
+	if json.Unmarshal(raw, &many) == nil {
+		names := make([]string, 0, len(many))
+		for _, item := range many {
+			if item.Name != "" {
+				names = append(names, item.Name)
+			}
+		}
+		if len(names) == 1 {
+			return names[0]
+		}
+	}
+	return ""
 }
 
 func jsonldFields(texts []string) (author, name string) {
 	var document struct {
-		Name     string `json:"name"`
-		Headline string `json:"headline"`
+		Name     string          `json:"name"`
+		Headline string          `json:"headline"`
+		Author   json.RawMessage `json:"author"`
 		Graph    []struct {
-			Type interface{} `json:"@type"`
-			Name string      `json:"name"`
+			Type   interface{}     `json:"@type"`
+			Name   string          `json:"name"`
+			Author json.RawMessage `json:"author"`
 		} `json:"@graph"`
 	}
 	for _, raw := range texts {
@@ -196,9 +230,20 @@ func jsonldFields(texts []string) (author, name string) {
 			name = firstNonEmpty(document.Name, document.Headline)
 		}
 		if author == "" {
+			author = jsonAuthorName(document.Author)
+		}
+		if author == "" {
 			for _, node := range document.Graph {
 				if isPersonType(node.Type) && node.Name != "" {
 					author = node.Name
+					break
+				}
+			}
+		}
+		if author == "" {
+			for _, node := range document.Graph {
+				if candidate := jsonAuthorName(node.Author); candidate != "" {
+					author = candidate
 					break
 				}
 			}
@@ -233,14 +278,6 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func truncateRunes(text string, limit int) string {
-	runes := []rune(text)
-	if len(runes) <= limit {
-		return text
-	}
-	return string(runes[:limit])
-}
-
 func attribute(node *html.Node, key string) string {
 	for _, attr := range node.Attr {
 		if strings.EqualFold(attr.Key, key) {
@@ -250,12 +287,11 @@ func attribute(node *html.Node, key string) string {
 	return ""
 }
 
-func absoluteURL(link, origin string) *url.URL {
-	root, failure := url.Parse(origin)
-	if failure != nil {
+func absoluteURL(link string, root *url.URL) *url.URL {
+	if root == nil {
 		return nil
 	}
-	parsed, failure := url.Parse(link)
+	parsed, failure := url.Parse(strings.TrimSpace(link))
 	if failure != nil {
 		return nil
 	}
@@ -282,8 +318,9 @@ func ParsePage(body []byte, origin string) Page {
 	if failure != nil {
 		return page
 	}
-	var titleTag, stated, generator, htmlLang, locale string
+	var titleTag, stated, generator, htmlLang, locale, contentLang, domAuthor string
 	var ogSite, ogTitle, twitterTitle, applicationName, description, address string
+	root, _ := url.Parse(origin)
 	originRegistrable := registrableOf(normalizeHost(origin))
 	hostCache := map[string]string{}
 	var texts strings.Builder
@@ -293,11 +330,8 @@ func ParsePage(body []byte, origin string) Page {
 	walk = func(node *html.Node, section string) {
 		if node.Type == html.ElementNode {
 			tag := strings.ToLower(node.Data)
-			switch tag {
-			case "nav":
-				section = "nav"
-			case "footer":
-				section = "footer"
+			if tag == "nav" || tag == "footer" {
+				section = tag
 			}
 			switch tag {
 			case "script":
@@ -316,41 +350,40 @@ func ParsePage(body []byte, origin string) Page {
 					address = nodeText(node)
 				}
 			case "meta":
-				name := strings.ToLower(attribute(node, "name"))
-				property := strings.ToLower(attribute(node, "property"))
-				content := attribute(node, "content")
+				name, property := strings.ToLower(attribute(node, "name")), strings.ToLower(attribute(node, "property"))
+				httpequiv, content := strings.ToLower(attribute(node, "http-equiv")), attribute(node, "content")
 				switch {
 				case name == "generator" && generator == "":
 					generator = content
-				case name == "author" && stated == "":
+				case stated == "" && (name == "author" || name == "article:author" || property == "article:author" || name == "twitter:creator"):
 					stated = content
-				case (name == "article:author" || property == "article:author") && stated == "":
-					stated = content
-				case name == "twitter:creator" && stated == "":
-					stated = content
-				case (name == "og:site_name" || property == "og:site_name") && ogSite == "":
+				case contentLang == "" && (name == "language" || httpequiv == "content-language"):
+					contentLang = content
+				case ogSite == "" && (name == "og:site_name" || property == "og:site_name"):
 					ogSite = content
-				case (name == "og:title" || property == "og:title") && ogTitle == "":
+				case ogTitle == "" && (name == "og:title" || property == "og:title"):
 					ogTitle = content
-				case name == "twitter:title" && twitterTitle == "":
+				case twitterTitle == "" && name == "twitter:title":
 					twitterTitle = content
-				case name == "application-name" && applicationName == "":
+				case applicationName == "" && name == "application-name":
 					applicationName = content
-				case (name == "description" || name == "og:description" || property == "og:description") && description == "":
+				case description == "" && (name == "description" || name == "og:description" || property == "og:description"):
 					description = content
-				case (name == "og:locale" || property == "og:locale") && locale == "":
+				case locale == "" && (name == "og:locale" || property == "og:locale"):
 					locale = content
 				}
 			case "html":
 				htmlLang = normalizeLang(attribute(node, "lang"))
+			case "body":
+				page.SinglePost = slices.ContainsFunc(strings.Fields(strings.ToLower(attribute(node, "class"))),
+					func(token string) bool { return strings.HasPrefix(token, "single") })
 			case "link":
-				if page.Feed == "" && strings.Contains(strings.ToLower(attribute(node, "rel")), "alternate") {
-					kind, link := strings.ToLower(attribute(node, "type")), attribute(node, "href")
-					if link != "" && (strings.Contains(kind, "atom") || strings.Contains(kind, "rss") ||
-						strings.Contains(kind, "feed+json")) {
-						if parsed := absoluteURL(link, origin); parsed != nil {
-							page.Feed = parsed.String()
-						}
+				kind, link := strings.ToLower(attribute(node, "type")), attribute(node, "href")
+				if page.Feed == "" && link != "" && strings.Contains(strings.ToLower(attribute(node, "rel")), "alternate") &&
+					slices.ContainsFunc([]string{"atom", "rss", "feed+json"},
+						func(mark string) bool { return strings.Contains(kind, mark) }) {
+					if parsed := absoluteURL(link, root); parsed != nil {
+						page.Feed = parsed.String()
 					}
 				}
 			case "a":
@@ -358,7 +391,12 @@ func ParsePage(body []byte, origin string) Page {
 				if link == "" {
 					return
 				}
-				parsed := absoluteURL(link, origin)
+				if !page.HasArchive {
+					mark := strings.ToLower(link + " " + nodeText(node))
+					page.HasArchive = slices.ContainsFunc([]string{"archive", "归档", "分页", "/page/", "older", "newer"},
+						func(hint string) bool { return strings.Contains(mark, hint) })
+				}
+				parsed := absoluteURL(link, root)
 				if parsed != nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
 					hostname, ok := hostCache[parsed.Host]
 					if !ok {
@@ -368,10 +406,9 @@ func ParsePage(body []byte, origin string) Page {
 					rel := strings.ToLower(attribute(node, "rel"))
 					style := strings.ToLower(attribute(node, "class") + " " + attribute(node, "id"))
 					entry := nodeText(node)
-					blocked := section == "nav" || section == "footer" ||
+					if section == "nav" || section == "footer" || entry == "" ||
 						strings.Contains(rel, "nofollow") || strings.Contains(rel, "sponsored") ||
-						strings.Contains(style, "social") || strings.Contains(style, "share") || entry == ""
-					if blocked {
+						strings.Contains(style, "social") || strings.Contains(style, "share") {
 						break
 					}
 					if len(page.Links) < 208 {
@@ -379,16 +416,19 @@ func ParsePage(body []byte, origin string) Page {
 					}
 					if len(page.Friends) < 16 && registrableOf(hostname) == originRegistrable {
 						lower := strings.ToLower(entry + " " + parsed.Path)
-						if strings.Contains(rel, "friend") || strings.Contains(rel, "blogroll") {
+						if strings.Contains(rel, "friend") || strings.Contains(rel, "blogroll") ||
+							slices.ContainsFunc([]string{"友链", "友情链接", "链接", "friend"},
+								func(word string) bool { return strings.Contains(lower, word) }) {
 							page.Friends = append(page.Friends, parsed.String())
-						} else {
-							for _, word := range []string{"友链", "友情链接", "链接", "friend"} {
-								if strings.Contains(lower, word) {
-									page.Friends = append(page.Friends, parsed.String())
-									break
-								}
-							}
 						}
+					}
+				}
+			default:
+				if domAuthor == "" && tag != "article" && tag != "h1" && tag != "h2" {
+					style := strings.ToLower(attribute(node, "class") + " " + attribute(node, "id"))
+					if slices.ContainsFunc([]string{"author", "byline", "vcard"},
+						func(mark string) bool { return strings.Contains(style, mark) }) {
+						domAuthor = firstNonEmpty(domAuthor, nodeText(node))
 					}
 				}
 			}
@@ -404,32 +444,21 @@ func ParsePage(body []byte, origin string) Page {
 	walk(document, "")
 	jsonAuthor, jsonTitle := jsonldFields(jsonlds)
 	page.Name = cleanTitle(firstNonEmpty(ogSite, titleTag, ogTitle, twitterTitle, applicationName, jsonTitle))
-	page.Language = htmlLang
-	if page.Language == "" {
-		page.Language = normalizeLang(locale)
-	}
+	page.Language = firstNonEmpty(htmlLang, normalizeLang(locale), normalizeLang(contentLang))
 	page.Framework = detectFramework(generator, body)
 	host := normalizeHost(origin)
 	accept := func(candidate string) string {
-		if word := collapse(candidate); word != "" && !vagueName(word) && !isContact(word) &&
-			!sameName(word, host) && !sameName(word, page.Name) {
+		if word := collapse(candidate); plausible(word, host, page.Name) {
 			return word
 		}
 		return ""
 	}
-	author := accept(stated)
-	if author == "" {
-		author = accept(jsonAuthor)
+	page.Author = firstNonEmpty(accept(stated), accept(jsonAuthor), accept(domAuthor), accept(address))
+	if page.Author == "" {
+		page.Author = accept(copyrightName(collapse(texts.String())))
 	}
-	if author == "" {
-		author = accept(address)
-	}
-	if author == "" {
-		author = accept(copyrightName(collapse(texts.String())))
-	}
-	page.Author = author
-	if match := icpPattern.FindString(string(body)); match != "" {
-		page.ICP = match
+	if match := regexp.MustCompile(`[\p{Han}]?ICP备\d+号|公网安备\d+号`).Find(body); match != nil {
+		page.ICP = string(match)
 	}
 	if description != "" {
 		page.Summary = truncateRunes(collapse(description), 256)
@@ -438,7 +467,7 @@ func ParsePage(body []byte, origin string) Page {
 }
 
 func copyrightName(text string) string {
-	match := copyrightPattern.FindStringIndex(text)
+	match := regexp.MustCompile(`(?i)(?:©|\(c\)|copyright)\s*(?:\d{4}(?:\s*[-–~至]\s*\d{4})?)?\s*`).FindStringIndex(text)
 	if match == nil {
 		return ""
 	}
@@ -451,26 +480,11 @@ func copyrightName(text string) string {
 	}
 	phrase = collapse(strings.Trim(phrase, " \t:：-—、,.。;；"))
 	lower = strings.ToLower(phrase)
-	for _, noise := range []string{"·", "•", "|", "｜", "/", "访客", "评论", "登录", "搜索", "rss", "design", "theme"} {
-		if strings.Contains(lower, noise) {
-			return ""
-		}
-	}
-	if vagueName(phrase) {
+	if slices.ContainsFunc([]string{"·", "•", "|", "｜", "/", "访客", "评论", "登录", "搜索", "rss", "design", "theme"},
+		func(noise string) bool { return strings.Contains(lower, noise) }) || vagueName(phrase) {
 		return ""
 	}
 	return phrase
-}
-
-func softMissing(title string) bool {
-	word := strings.ToLower(collapse(title))
-	for _, mark := range []string{"404", "not found", "页面不存在", "找不到页面", "access denied",
-		"welcome to nginx", "index of /", "default web site page", "站点未找到"} {
-		if strings.Contains(word, mark) {
-			return true
-		}
-	}
-	return false
 }
 
 func frameworkName(stated string) string {
@@ -482,10 +496,9 @@ func frameworkName(stated string) string {
 		return ""
 	}
 	name := fields[0]
-	if len([]rune(name)) < 2 || len([]rune(name)) > 32 || strings.ContainsAny(name, "0123456789@") {
-		return ""
-	}
-	if strings.Contains(name, "'s ") || strings.Contains(name, "’s ") {
+	size := utf8.RuneCountInString(name)
+	if size < 2 || size > 32 || strings.ContainsAny(name, "0123456789@") ||
+		strings.Contains(name, "'s ") || strings.Contains(name, "’s ") {
 		return ""
 	}
 	return name
@@ -498,21 +511,21 @@ func detectFramework(stated string, body []byte) string {
 		{"typecho", "/usr/themes/", "Typecho"},
 		{"astro", "/_astro/", "Astro"},
 		{"next.js", "_next/", "Next.js"},
+		{"gatsby", "___gatsby", "Gatsby"},
+		{"ghost", "/assets/built/", "Ghost"},
 	}
-	if stated != "" {
-		lower := strings.ToLower(stated)
-		for _, row := range rows {
-			if strings.Contains(lower, row[0]) {
-				return row[2]
-			}
-		}
-		if name := frameworkName(stated); name != "" {
-			return name
-		}
-	}
-	lower := bytes.ToLower(body)
+	lower := strings.ToLower(stated)
 	for _, row := range rows {
-		if bytes.Contains(lower, []byte(row[1])) {
+		if strings.Contains(lower, row[0]) {
+			return row[2]
+		}
+	}
+	if name := frameworkName(stated); name != "" {
+		return name
+	}
+	lowered := bytes.ToLower(body)
+	for _, row := range rows {
+		if bytes.Contains(lowered, []byte(row[1])) {
 			return row[2]
 		}
 	}
@@ -542,9 +555,12 @@ func ParseSitemap(body []byte) []string {
 
 type RssDoc struct {
 	Channel struct {
-		Title    string `xml:"title"`
-		Language string `xml:"language"`
-		Items    []struct {
+		Title          string `xml:"title"`
+		Language       string `xml:"language"`
+		Creator        string `xml:"http://purl.org/dc/elements/1.1/ creator"`
+		ManagingEditor string `xml:"managingEditor"`
+		Author         string `xml:"author"`
+		Items          []struct {
 			Creator string `xml:"http://purl.org/dc/elements/1.1/ creator"`
 			Author  string `xml:"author"`
 		} `xml:"item"`
@@ -555,48 +571,32 @@ type AtomDoc struct {
 	XMLName  xml.Name `xml:"feed"`
 	Title    string   `xml:"title"`
 	Language string   `xml:"http://www.w3.org/XML/1998/namespace lang,attr"`
+	Author   named    `xml:"author"`
 	Entries  []struct {
-		Authors []struct {
-			Name string `xml:"name"`
-		} `xml:"author"`
+		Authors []named `xml:"author"`
 	} `xml:"entry"`
 }
 
 type JsonDoc struct {
 	Title string `json:"title"`
 	Items []struct {
-		Authors []struct {
-			Name string `json:"name"`
-		} `json:"authors"`
+		Authors []named `json:"authors"`
 	} `json:"items"`
-}
-
-func feedHead(body []byte) []byte {
-	limit := len(body)
-	if limit > 512 {
-		limit = 512
-	}
-	if index := bytes.IndexByte(body[:limit], '>'); index >= 0 {
-		return body[:index+1]
-	}
-	return body[:limit]
-}
-
-func closeTruncated(body []byte) []byte {
-	for _, row := range [][2]string{{"</item>", "</channel></rss>"}, {"</entry>", "</feed>"}} {
-		index := bytes.LastIndex(body, []byte(row[0]))
-		if index > 0 {
-			return append(append([]byte{}, body[:index+len(row[0])]...), row[1]...)
-		}
-	}
-	return body
 }
 
 func decodeFeed(body []byte, target any) error {
 	if failure := xml.Unmarshal(body, target); failure == nil {
 		return nil
 	}
-	return xml.Unmarshal(closeTruncated(body), target)
+	closed := body
+	for _, row := range [][2]string{{"</item>", "</channel></rss>"}, {"</entry>", "</feed>"}} {
+		index := bytes.LastIndex(body, []byte(row[0]))
+		if index > 0 {
+			closed = append(append([]byte{}, body[:index+len(row[0])]...), row[1]...)
+			break
+		}
+	}
+	return xml.Unmarshal(closed, target)
 }
 
 func ParseSubscription(body []byte) Subscription {
@@ -605,6 +605,7 @@ func ParseSubscription(body []byte) Subscription {
 		return Subscription{}
 	}
 	var subscription Subscription
+	head := bytes.ToLower(trimmed[:min(len(trimmed), 1024)])
 	switch {
 	case bytes.HasPrefix(trimmed, []byte("{")):
 		var decoded JsonDoc
@@ -617,12 +618,15 @@ func ParseSubscription(body []byte) Subscription {
 				subscription.addAuthor(person.Name)
 			}
 		}
-	case bytes.Contains(feedHead(trimmed), []byte("<rss")):
+	case bytes.Contains(head, []byte("<rss")) || bytes.Contains(head, []byte("<rdf")):
 		var channel RssDoc
 		if decodeFeed(trimmed, &channel) != nil {
 			return Subscription{}
 		}
 		subscription = Subscription{Parsed: true, Name: cleanTitle(channel.Channel.Title), Language: normalizeLang(channel.Channel.Language)}
+		subscription.addAuthor(channel.Channel.Creator)
+		subscription.addAuthor(channel.Channel.ManagingEditor)
+		subscription.addAuthor(channel.Channel.Author)
 		for _, item := range channel.Channel.Items {
 			subscription.addAuthor(item.Creator)
 			subscription.addAuthor(item.Author)
@@ -633,6 +637,7 @@ func ParseSubscription(body []byte) Subscription {
 			return Subscription{}
 		}
 		subscription = Subscription{Parsed: true, Name: cleanTitle(document.Title), Language: normalizeLang(document.Language)}
+		subscription.addAuthor(document.Author.Name)
 		for _, entry := range document.Entries {
 			for _, person := range entry.Authors {
 				subscription.addAuthor(person.Name)
@@ -644,13 +649,8 @@ func ParseSubscription(body []byte) Subscription {
 
 func (subscription *Subscription) addAuthor(author string) {
 	word := collapse(author)
-	if vagueName(word) || isContact(word) {
-		return
+	if plausible(word) && !slices.ContainsFunc(subscription.Authors,
+		func(existing string) bool { return strings.EqualFold(existing, word) }) {
+		subscription.Authors = append(subscription.Authors, word)
 	}
-	for _, existing := range subscription.Authors {
-		if strings.EqualFold(existing, word) {
-			return
-		}
-	}
-	subscription.Authors = append(subscription.Authors, word)
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	_ "modernc.org/sqlite"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"time"
 )
+
+var schemaSQL string
 
 type Site struct {
 	Host      string
@@ -32,6 +35,10 @@ type BlogTable struct {
 	write    *sql.Stmt
 }
 
+func placeholders(count int) string {
+	return "(?" + strings.Repeat(",?", count-1) + ")"
+}
+
 func OpenBlogTable(path string) (*BlogTable, error) {
 	if directory := filepath.Dir(path); directory != "" && directory != "." {
 		if failure := os.MkdirAll(directory, 0o755); failure != nil {
@@ -47,25 +54,7 @@ func OpenBlogTable(path string) (*BlogTable, error) {
 	connection.SetMaxIdleConns(16)
 	connection.SetConnMaxIdleTime(5 * time.Minute)
 	connection.SetConnMaxLifetime(60 * time.Minute)
-	schema := `
-CREATE TABLE IF NOT EXISTS blog (
- host      TEXT PRIMARY KEY,
- feed      TEXT NOT NULL DEFAULT '',
- lang      TEXT NOT NULL DEFAULT '',
- name      TEXT NOT NULL DEFAULT '',
- author    TEXT NOT NULL DEFAULT '',
- icp       TEXT NOT NULL DEFAULT '',
- summary   TEXT NOT NULL DEFAULT '',
- tag       TEXT NOT NULL DEFAULT '',
- friend    TEXT NOT NULL DEFAULT '',
- framework TEXT NOT NULL DEFAULT '',
- state     TEXT NOT NULL DEFAULT 'pend',
- cert      INTEGER NOT NULL DEFAULT 0,
- create_at TEXT NOT NULL DEFAULT '',
- check_at  TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS blog_queue ON blog (check_at, create_at);`
-	if _, failure := connection.Exec(schema); failure != nil {
+	if _, failure := connection.Exec(schemaSQL); failure != nil {
 		connection.Close()
 		return nil, failure
 	}
@@ -80,48 +69,32 @@ CREATE INDEX IF NOT EXISTS blog_queue ON blog (check_at, create_at);`
 	return &BlogTable{database: connection, write: write}, nil
 }
 
-func (table *BlogTable) Close() error { return table.database.Close() }
-
-func (table *BlogTable) Enqueue(hosts []string, now time.Time) (inserted int) {
-	var failure error
-	defer func() {
-		if failure != nil {
-			fmt.Fprintf(os.Stderr, "写入失败：外链%v\n", failure)
-			inserted = 0
-		}
-	}()
+func (table *BlogTable) Enqueue(hosts []string, now time.Time) {
 	stamp := now.Format(time.RFC3339)
-	transaction, failure := table.database.Begin()
-	if failure != nil {
-		return
-	}
-	defer transaction.Rollback()
-	statement, failure := transaction.Prepare(`INSERT INTO blog (host, state, create_at, check_at) VALUES (?,?,?,?)
-		ON CONFLICT(host) DO NOTHING`)
-	if failure != nil {
-		return
-	}
-	var handle sql.Result
-	for _, raw := range hosts {
-		host := Judge(raw)
-		if host == "" {
-			continue
-		}
-		handle, failure = statement.Exec(host, "pend", stamp, stamp)
+	failure := func() error {
+		transaction, failure := table.database.Begin()
 		if failure != nil {
-			return
+			return failure
 		}
-		if affected, _ := handle.RowsAffected(); affected > 0 {
-			inserted++
+		defer transaction.Rollback()
+		statement, failure := transaction.Prepare(`INSERT INTO blog (host, state, create_at, check_at) VALUES (?,?,?,?)
+		ON CONFLICT(host) DO NOTHING`)
+		if failure != nil {
+			return failure
 		}
+		defer statement.Close()
+		for _, raw := range hosts {
+			if host := Judge(raw); host != "" {
+				if _, failure := statement.Exec(host, "pend", stamp, stamp); failure != nil {
+					return failure
+				}
+			}
+		}
+		return transaction.Commit()
+	}()
+	if failure != nil {
+		fmt.Fprintf(os.Stderr, "写入失败：外链 %v", failure)
 	}
-	if failure = statement.Close(); failure != nil {
-		return
-	}
-	if failure = transaction.Commit(); failure != nil {
-		return
-	}
-	return
 }
 
 func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site, error) {
@@ -129,13 +102,12 @@ func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site
 		WHERE check_at<>'' AND check_at<=?`
 	arguments := []any{now.Format(time.RFC3339)}
 	if len(busy) > 0 {
-		query += ` AND host NOT IN (?` + strings.Repeat(",?", len(busy)-1) + `)`
+		query += ` AND host NOT IN ` + placeholders(len(busy))
 		for _, host := range busy {
 			arguments = append(arguments, host)
 		}
 	}
-	rows, failure := table.database.Query(query+` ORDER BY check_at ASC LIMIT ?`,
-		append(arguments, batch)...)
+	rows, failure := table.database.Query(query+` ORDER BY check_at ASC LIMIT ?`, append(arguments, batch)...)
 	if failure != nil {
 		return nil, failure
 	}
@@ -158,21 +130,11 @@ func (table *BlogTable) NextDue(now time.Time) time.Duration {
 	var text sql.NullString
 	failure := table.database.QueryRow(`SELECT MIN(check_at) FROM blog WHERE check_at<>'' AND check_at>?`,
 		now.Format(time.RFC3339)).Scan(&text)
-	if failure != nil || !text.Valid {
+	when, parseFailure := time.Parse(time.RFC3339, text.String)
+	if failure != nil || parseFailure != nil {
 		return 5 * time.Minute
 	}
-	when, failure := time.Parse(time.RFC3339, text.String)
-	if failure != nil {
-		return 5 * time.Minute
-	}
-	delay := time.Until(when)
-	if delay < 5*time.Second {
-		delay = 5 * time.Second
-	}
-	if delay > 5*time.Minute {
-		delay = 5 * time.Minute
-	}
-	return delay
+	return min(max(time.Until(when), 5*time.Second), 5*time.Minute)
 }
 
 func (table *BlogTable) FriendOrdinals(hosts []string) string {
@@ -193,8 +155,7 @@ func (table *BlogTable) FriendOrdinals(hosts []string) string {
 	for index, host := range keys {
 		arguments[index] = host
 	}
-	rows, failure := table.database.Query(`SELECT host,rowid FROM blog WHERE host IN (?`+
-		strings.Repeat(",?", len(keys)-1)+`)`, arguments...)
+	rows, failure := table.database.Query(`SELECT host,rowid FROM blog WHERE host IN `+placeholders(len(keys)), arguments...)
 	if failure != nil {
 		return ""
 	}
@@ -217,11 +178,8 @@ func (table *BlogTable) FriendOrdinals(hosts []string) string {
 			ids = append(ids, id)
 		}
 	}
-	if len(ids) == 0 {
-		return ""
-	}
 	text, failure := json.Marshal(ids)
-	if failure != nil {
+	if failure != nil || len(ids) == 0 {
 		return ""
 	}
 	return string(text)
@@ -230,48 +188,35 @@ func (table *BlogTable) FriendOrdinals(hosts []string) string {
 func (table *BlogTable) Save(site *Site, outcome Outcome) {
 	now := time.Now().UTC()
 	schedule := func(delay time.Duration) { site.CheckAt = now.Add(delay).Format(time.RFC3339) }
-	keep := func(field *string, value string) {
-		if value != "" {
-			*field = value
-		}
-	}
 	switch outcome.State {
 	case "alive":
-		site.State = outcome.State
-		keep(&site.Name, outcome.Name)
-		keep(&site.Author, outcome.Author)
-		keep(&site.Feed, outcome.Feed)
-		keep(&site.Language, outcome.Language)
-		keep(&site.Framework, outcome.Framework)
-		keep(&site.ICP, outcome.ICP)
-		keep(&site.Summary, outcome.Summary)
-		keep(&site.Friend, outcome.Friend)
-		delay := 30 * 24 * time.Hour
-		if !outcome.CertEnd.IsZero() {
-			if margin := outcome.CertEnd.Sub(now) - 3*24*time.Hour; margin > 0 && margin < delay {
-				delay = margin
+		site.State = "alive"
+		for _, pair := range [][2]*string{
+			{&site.Name, &outcome.Name}, {&site.Author, &outcome.Author}, {&site.Feed, &outcome.Feed},
+			{&site.Language, &outcome.Language}, {&site.Framework, &outcome.Framework},
+			{&site.ICP, &outcome.ICP}, {&site.Summary, &outcome.Summary}, {&site.Friend, &outcome.Friend},
+		} {
+			if *pair[1] != "" {
+				*pair[0] = *pair[1]
 			}
 		}
+		delay := 30 * 24 * time.Hour
+		if margin := outcome.CertEnd.Sub(now) - 3*24*time.Hour; !outcome.CertEnd.IsZero() && margin > 0 && margin < delay {
+			delay = margin
+		}
 		schedule(delay)
-	case "dead":
+	case "other", "dead":
 		site.State, site.CheckAt = outcome.State, ""
 	default:
-		if outcome.Local {
+		if site.State == "alive" {
 			schedule(24 * time.Hour)
-			break
-		}
-		switch site.State {
-		case "pend", "alive":
-			site.State = "retry"
-			schedule(24 * time.Hour)
-		default:
+		} else {
 			site.State, site.CheckAt = "dead", ""
 		}
 	}
 	site.Cert = site.Cert || outcome.Cert
-	_, failure := table.write.Exec(site.Host, site.Feed, site.Language, site.Name, site.Author, site.ICP,
-		site.Summary, site.Tags, site.Friend, site.Framework, site.State, site.Cert, site.CheckAt)
-	if failure != nil {
-		fmt.Fprintf(os.Stderr, "写入 %s 失败：%v\n", site.Host, failure)
+	if _, failure := table.write.Exec(site.Host, site.Feed, site.Language, site.Name, site.Author, site.ICP,
+		site.Summary, site.Tags, site.Friend, site.Framework, site.State, site.Cert, site.CheckAt); failure != nil {
+		fmt.Fprintf(os.Stderr, "写入 %s 失败：%v", site.Host, failure)
 	}
 }

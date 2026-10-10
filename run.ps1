@@ -1,6 +1,7 @@
 param(
     [switch]$SkipBuild,
-    [switch]$Truncate
+    [switch]$Truncate,
+    [int]$Duration = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,8 +37,28 @@ try {
     $OutputEncoding           = $utf8
 
     Write-Host "日志：$log"
-    Write-Host "停止：Ctrl+C"
-    & $exe 2>&1 | Tee-Object -FilePath $log -Append
+    if ($Duration -gt 0) {
+        Write-Host "时长：$Duration 分钟"
+    }
+    else {
+        Write-Host "停止：Ctrl+C"
+    }
+
+    $watchdog = $null
+    if ($Duration -gt 0) {
+        $watchdog = Start-Job -ScriptBlock {
+            param($minutes)
+            Start-Sleep -Seconds ($minutes * 60)
+            Get-Process -Name 'blogsearch' -ErrorAction SilentlyContinue | Stop-Process -Force
+        } -ArgumentList $Duration
+    }
+
+    try {
+        & $exe 2>&1 | Tee-Object -FilePath $log -Append
+    }
+    finally {
+        if ($watchdog) { Remove-Job -Job $watchdog -Force -ErrorAction SilentlyContinue }
+    }
     exit $LASTEXITCODE
 }
 finally {

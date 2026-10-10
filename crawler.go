@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"golang.org/x/net/html/charset"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -30,15 +33,12 @@ type PageReply struct {
 
 type Outcome struct {
 	State     string
-	Local     bool
 	Reason    string
 	Links     []string
 	Friends   []string
 	Friend    string
 	Requests  int
 	Timeouts  int
-	Bytes     int
-	Latency   time.Duration
 	Cert      bool
 	CertEnd   time.Time
 	Name      string
@@ -51,21 +51,8 @@ type Outcome struct {
 }
 
 type BatchTally struct {
-	Sites    int
 	Requests int
-	Bytes    int
-	Expanded int
 	Timeouts int
-	Latency  time.Duration
-}
-
-func (tally *BatchTally) add(outcome Outcome, inserted int) {
-	tally.Sites++
-	tally.Requests += outcome.Requests
-	tally.Bytes += outcome.Bytes
-	tally.Expanded += inserted
-	tally.Timeouts += outcome.Timeouts
-	tally.Latency += outcome.Latency
 }
 
 type Crawler struct {
@@ -112,24 +99,7 @@ func (crawler *Crawler) Timeout() time.Duration {
 	crawler.guard.Lock()
 	latency := crawler.latency
 	crawler.guard.Unlock()
-	if latency <= 0 {
-		return 10 * time.Second
-	}
-	timeout := time.Duration(4 * latency * float64(time.Second))
-	if timeout < 10*time.Second {
-		return 10 * time.Second
-	}
-	if timeout > 60*time.Second {
-		return 60 * time.Second
-	}
-	return timeout
-}
-
-func (crawler *Crawler) observe(elapsed time.Duration) {
-	sample := elapsed.Seconds()
-	crawler.guard.Lock()
-	crawler.latency += (sample - crawler.latency) * 0.1
-	crawler.guard.Unlock()
+	return min(max(time.Duration(4*latency*float64(time.Second)), 10*time.Second), 60*time.Second)
 }
 
 func (crawler *Crawler) recall(key string) string {
@@ -148,32 +118,6 @@ func (crawler *Crawler) memorize(key, target string) {
 	crawler.guard.Unlock()
 }
 
-func timedOut(failure error) bool {
-	if failure == nil {
-		return false
-	}
-	if errors.Is(failure, context.DeadlineExceeded) {
-		return true
-	}
-	text := failure.Error()
-	return strings.Contains(text, "i/o timeout") ||
-		strings.Contains(text, "handshake timeout") ||
-		strings.Contains(text, "Client.Timeout") ||
-		strings.Contains(text, "context deadline exceeded")
-}
-
-func decodeBody(body []byte, contentType string) []byte {
-	reader, failure := charset.NewReader(bytes.NewReader(body), contentType)
-	if failure != nil {
-		return body
-	}
-	decoded, failure := io.ReadAll(reader)
-	if failure != nil || len(decoded) == 0 {
-		return body
-	}
-	return decoded
-}
-
 func (crawler *Crawler) fetch(task context.Context, target string, follow, relaxed bool) (*PageReply, error) {
 	client := crawler.client
 	switch {
@@ -188,7 +132,6 @@ func (crawler *Crawler) fetch(task context.Context, target string, follow, relax
 	if failure != nil {
 		return nil, failure
 	}
-	request.Header.Set("User-Agent", "blogsearch")
 	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	response, failure := client.Do(request)
 	if failure != nil {
@@ -196,7 +139,13 @@ func (crawler *Crawler) fetch(task context.Context, target string, follow, relax
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	reply := &PageReply{Status: response.StatusCode, Body: decodeBody(body, response.Header.Get("Content-Type")),
+	decoded := body
+	if reader, failure := charset.NewReader(bytes.NewReader(body), response.Header.Get("Content-Type")); failure == nil {
+		if text, failure := io.ReadAll(reader); failure == nil && len(text) > 0 {
+			decoded = text
+		}
+	}
+	reply := &PageReply{Status: response.StatusCode, Body: decoded,
 		Location: strings.TrimSpace(response.Header.Get("Location")),
 		Language: strings.TrimSpace(response.Header.Get("Content-Language"))}
 	if response.TLS != nil && len(response.TLS.PeerCertificates) > 0 {
@@ -210,29 +159,18 @@ func (crawler *Crawler) attempt(task context.Context, outcome *Outcome, target s
 	reply, failure := crawler.fetch(task, target, follow, relaxed)
 	elapsed := time.Since(started)
 	outcome.Requests++
-	outcome.Latency += elapsed
 	if failure == nil {
-		crawler.observe(elapsed)
-	} else if timedOut(failure) {
+		crawler.guard.Lock()
+		crawler.latency += (elapsed.Seconds() - crawler.latency) * 0.1
+		crawler.guard.Unlock()
+		return reply, nil
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.Is(failure, context.DeadlineExceeded) ||
+		(errors.As(failure, &timeout) && timeout.Timeout()) {
 		outcome.Timeouts++
 	}
 	return reply, failure
-}
-
-func plain(target string) string {
-	if !strings.HasPrefix(target, "https://") {
-		return ""
-	}
-	return "http://" + strings.TrimPrefix(target, "https://")
-}
-
-func idlePort(failure error) bool {
-	text := failure.Error()
-	return strings.Contains(text, "actively refused") || strings.HasSuffix(text, "EOF")
-}
-
-func brokenCert(failure error) bool {
-	return errors.As(failure, new(*tls.CertificateVerificationError))
 }
 
 func (crawler *Crawler) fetchEither(task context.Context, outcome *Outcome, target string, follow bool) (*PageReply, string, error) {
@@ -240,15 +178,20 @@ func (crawler *Crawler) fetchEither(task context.Context, outcome *Outcome, targ
 	if failure == nil {
 		return reply, target, nil
 	}
-	if brokenCert(failure) {
+	var certFailure *tls.CertificateVerificationError
+	if errors.As(failure, &certFailure) {
 		outcome.Cert = true
-		reply, failure = crawler.attempt(task, outcome, target, follow, true)
-		if failure == nil {
+		if reply, failure = crawler.attempt(task, outcome, target, follow, true); failure == nil {
 			return reply, target, nil
 		}
 	}
-	fallback := plain(target)
-	if fallback == "" || !idlePort(failure) {
+	fallback := ""
+	if strings.HasPrefix(target, "https://") {
+		fallback = "http://" + strings.TrimPrefix(target, "https://")
+	}
+	refused := errors.Is(failure, syscall.ECONNREFUSED)
+	closed := errors.Is(failure, io.EOF) || errors.Is(failure, io.ErrUnexpectedEOF)
+	if fallback == "" || (!refused && !closed) {
 		return nil, target, failure
 	}
 	reply, failure = crawler.attempt(task, outcome, fallback, follow, false)
@@ -261,18 +204,9 @@ func (crawler *Crawler) probe(task context.Context, outcome *Outcome, candidates
 		if failure != nil || reply.Status != http.StatusOK {
 			continue
 		}
-		outcome.Bytes += len(reply.Body)
 		return reply, target
 	}
 	return nil, ""
-}
-
-func authoritative(failure error) bool {
-	record := &net.DNSError{}
-	if !errors.As(failure, &record) || record.IsTemporary {
-		return false
-	}
-	return record.IsNotFound || strings.Contains(record.Err, "no data")
 }
 
 func fail(outcome *Outcome, state, reason, payload string) {
@@ -284,9 +218,28 @@ func fail(outcome *Outcome, state, reason, payload string) {
 	outcome.Reason = reason + "：" + payload
 }
 
-var feedPaths = []string{"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/rss.xml"}
+var hubHosts = map[string]bool{
+	"github.com": true, "zhihu.com": true, "weibo.com": true, "csdn.net": true,
+	"jianshu.com": true, "facebook.com": true, "twitter.com": true, "x.com": true,
+	"youtube.com": true, "medium.com": true, "douban.com": true, "bilibili.com": true,
+	"linkedin.com": true, "instagram.com": true, "pinterest.com": true, "reddit.com": true,
+	"tumblr.com": true, "wordpress.com": true, "blogspot.com": true, "wanandroid.com": true,
+	"ituring.com.cn": true, "foreverblog.cn": true, "storeweb.cn": true,
+	"listbox.app": true, "urschool.org": true, "cafenomad.tw": true,
+}
 
-var sitemapPaths = []string{"/sitemap.xml", "/sitemap_index.xml"}
+func notBlog(site *Site, page Page, outcome *Outcome) bool {
+	if outcome.Feed != "" || site.Feed != "" || outcome.Framework != "" || outcome.ICP != "" ||
+		page.HasArchive || len(outcome.Friends) > 0 {
+		return false
+	}
+	mark := strings.ToLower(collapse(page.Name))
+	return hubHosts[registrableOf(site.Host)] || mark == "" || mark == "首页" || mark == "home" ||
+		slices.ContainsFunc([]string{"index of", "网站维护中", "建站中", "维护中", "coming soon",
+			"域名出售", "域名停放", "网址导航", "搜索引擎"}, func(word string) bool {
+			return strings.Contains(mark, word)
+		})
+}
 
 func pathsOn(host string, guesses []string) []string {
 	addresses := make([]string, 0, len(guesses))
@@ -313,12 +266,14 @@ func (collector *collector) add(raw string) string {
 
 func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome, registrable string, collector *collector) (Page, bool) {
 	dead := func(failure error) {
-		fail(outcome, "pend", "抓取失败", failure.Error())
-		if authoritative(failure) {
+		record := &net.DNSError{}
+		rejected := errors.As(failure, &record) && !record.IsTemporary &&
+			(record.IsNotFound || strings.Contains(record.Err, "no data"))
+		if rejected {
 			outcome.State, outcome.Reason = "dead", "地址无效"
-		} else {
-			outcome.Local = errors.As(failure, new(*net.DNSError))
+			return
 		}
+		fail(outcome, "pend", "抓取失败", failure.Error())
 	}
 	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
 	if failure != nil {
@@ -341,7 +296,6 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 			dead(failure)
 			return Page{}, false
 		}
-		outcome.Bytes += len(reply.Body)
 		if !reply.CertEnd.IsZero() {
 			outcome.CertEnd = reply.CertEnd
 		}
@@ -376,7 +330,10 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 		return Page{}, false
 	}
 	page := ParsePage(reply.Body, target)
-	if softMissing(page.Name) {
+	title := strings.ToLower(collapse(page.Name))
+	if slices.ContainsFunc([]string{"404", "not found", "页面不存在", "找不到页面", "access denied",
+		"welcome to nginx", "index of /", "default web site page", "站点未找到"},
+		func(mark string) bool { return strings.Contains(title, mark) }) {
 		fail(outcome, "pend", "应答失败", "200")
 		return Page{}, false
 	}
@@ -389,14 +346,26 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 }
 
 func (crawler *Crawler) expand(task context.Context, site *Site, page Page, outcome *Outcome, registrable string, collector *collector) {
-	friends := make([]string, 0, len(page.Friends)+len(friendPaths))
+	if hubHosts[registrable] {
+		return
+	}
+	guesses := []string{"/links", "/friends", "/link", "/blogroll", "/friend", "/links/", "/link.html"}
+	friends := make([]string, 0, len(page.Friends)+len(guesses))
 	friends = append(friends, page.Friends...)
-	friends = append(friends, pathsOn(site.Host, friendPaths)...)
+	friends = append(friends, pathsOn(site.Host, guesses)...)
 	if reply, target := crawler.probe(task, outcome, friends); reply != nil {
+		added := 0
 		for _, link := range ParsePage(reply.Body, target).Links {
-			if registrableOf(link) != registrable {
-				collector.add(link)
-				outcome.Friends = append(outcome.Friends, link)
+			if added >= 60 {
+				break
+			}
+			neighbor := registrableOf(link)
+			if neighbor == registrable || hubHosts[neighbor] {
+				continue
+			}
+			if host := collector.add(link); host != "" {
+				outcome.Friends = append(outcome.Friends, host)
+				added++
 			}
 		}
 	}
@@ -407,18 +376,24 @@ func (crawler *Crawler) subscribe(task context.Context, site *Site, page Page, o
 	if key == "" {
 		key = "default"
 	}
-	candidates := make([]string, 0, len(feedPaths)+3)
+	guesses := []string{
+		"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/feed/", "/rss.xml",
+		"/rss", "/rss/", "/atom", "/index.atom", "/index.rss",
+		"/blog/feed", "/blog/atom.xml", "/blog/index.xml", "/posts/index.xml",
+		"/feeds/posts/default",
+	}
+	candidates := make([]string, 0, len(guesses)+3)
 	if site.Feed != "" {
 		candidates = append(candidates, site.Feed)
 	}
 	if recalled := crawler.recall("feed:" + key); recalled != "" {
 		candidates = append(candidates, "https://"+site.Host+recalled)
 	}
-	switch {
-	case page.Feed == "":
-		candidates = append(candidates, pathsOn(site.Host, feedPaths)...)
-	case page.Feed != site.Feed:
-		candidates = append(candidates, page.Feed)
+	if page.Feed != site.Feed {
+		if page.Feed != "" {
+			candidates = append(candidates, page.Feed)
+		}
+		candidates = append(candidates, pathsOn(site.Host, guesses)...)
 	}
 	reason := ""
 	for _, candidate := range candidates {
@@ -436,12 +411,8 @@ func (crawler *Crawler) subscribe(task context.Context, site *Site, page Page, o
 			if reason == "" {
 				reason = strconv.Itoa(reply.Status)
 			}
-			if page.Feed != "" {
-				break
-			}
 			continue
 		}
-		outcome.Bytes += len(reply.Body)
 		subscription := ParseSubscription(reply.Body)
 		if !subscription.Parsed {
 			continue
@@ -475,12 +446,15 @@ func (crawler *Crawler) Crawl(task context.Context, site *Site, full bool) Outco
 	}
 	if full {
 		crawler.subscribe(task, site, page, &outcome)
-		candidates := pathsOn(site.Host, sitemapPaths)
+		candidates := pathsOn(site.Host, []string{"/sitemap.xml", "/sitemap_index.xml"})
 		if recalled := crawler.recall("sitemap"); recalled != "" {
 			candidates = append([]string{"https://" + site.Host + recalled}, candidates...)
 		}
 		if reply, target := crawler.probe(task, &outcome, candidates); reply != nil {
 			for _, link := range ParseSitemap(reply.Body) {
+				if hubHosts[registrableOf(link)] {
+					continue
+				}
 				collector.add(link)
 			}
 			crawler.memorize("sitemap", target)
@@ -488,6 +462,9 @@ func (crawler *Crawler) Crawl(task context.Context, site *Site, full bool) Outco
 	}
 	crawler.expand(task, site, page, &outcome, registrable, collector)
 	outcome.Links = collector.items
+	if notBlog(site, page, &outcome) || (page.SinglePost && !page.HasArchive) {
+		outcome.State, outcome.Reason = "other", "非博客"
+	}
 	return outcome
 }
 
@@ -498,15 +475,6 @@ type tuner struct {
 	ceiling int32
 }
 
-func newTuner() *tuner {
-	floor := int32(runtime.GOMAXPROCS(0))
-	return &tuner{worker: floor, floor: floor, ceiling: floor * 4}
-}
-
-func (tuner *tuner) workers() int { return int(atomic.LoadInt32(&tuner.worker)) }
-
-func (tuner *tuner) cap() int { return int(atomic.LoadInt32(&tuner.ceiling)) }
-
 func (tuner *tuner) tune(count BatchTally) {
 	if count.Requests == 0 {
 		return
@@ -514,27 +482,18 @@ func (tuner *tuner) tune(count BatchTally) {
 	tuner.guard.Lock()
 	defer tuner.guard.Unlock()
 	worker := int(atomic.LoadInt32(&tuner.worker))
-	floor, ceiling := int(tuner.floor), int(tuner.ceiling)
-	ratio := float64(count.Timeouts) / float64(count.Requests)
-	switch {
+	switch ratio := float64(count.Timeouts) / float64(count.Requests); {
 	case ratio > 0.10:
 		worker /= 2
 	case ratio < 0.05:
 		worker += 4
 	}
-	if worker < floor {
-		worker = floor
-	}
-	if worker > ceiling {
-		worker = ceiling
-	}
-	atomic.StoreInt32(&tuner.worker, int32(worker))
+	atomic.StoreInt32(&tuner.worker, int32(min(max(worker, int(tuner.floor)), int(tuner.ceiling))))
 }
 
 type completed struct {
-	site     Site
-	outcome  Outcome
-	inserted int
+	site    Site
+	outcome Outcome
 }
 
 func takeWindow(tally *BatchTally, guard *sync.Mutex) BatchTally {
@@ -546,8 +505,9 @@ func takeWindow(tally *BatchTally, guard *sync.Mutex) BatchTally {
 }
 
 func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) error {
-	knob := newTuner()
-	capacity := knob.cap()
+	floor := int32(runtime.GOMAXPROCS(0))
+	knob := &tuner{worker: floor, floor: floor, ceiling: floor * 4}
+	capacity := int(atomic.LoadInt32(&knob.ceiling))
 	jobs := make(chan Site, capacity)
 	results := make(chan completed, capacity)
 	inflight := map[string]bool{}
@@ -560,7 +520,8 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 			defer pool.Done()
 			for site := range jobs {
 				siteCtx, cancel := context.WithTimeout(task, crawler.Timeout())
-				outcome := crawler.Crawl(siteCtx, &site, site.State != "alive")
+				complete := site.Name != "" && site.Feed != "" && site.Language != ""
+				outcome := crawler.Crawl(siteCtx, &site, site.State != "alive" || !complete)
 				cancel()
 				results <- completed{site: site, outcome: outcome}
 			}
@@ -569,15 +530,12 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 
 	tuneTicker := time.NewTicker(5 * time.Second)
 	defer tuneTicker.Stop()
-	reportTicker := time.NewTicker(5 * time.Minute)
-	defer reportTicker.Stop()
 
-	var window, cycle BatchTally
-	mark, round := time.Now(), 1
+	var cycle BatchTally
 
 	handle := func(done completed) {
 		if len(done.outcome.Links) > 0 {
-			done.inserted = table.Enqueue(done.outcome.Links, time.Now().UTC())
+			table.Enqueue(done.outcome.Links, time.Now().UTC())
 		}
 		if len(done.outcome.Friends) > 0 {
 			done.outcome.Friend = table.FriendOrdinals(done.outcome.Friends)
@@ -585,51 +543,49 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 		table.Save(&done.site, done.outcome)
 		guard.Lock()
 		delete(inflight, done.site.Host)
-		window.add(done.outcome, done.inserted)
-		cycle.add(done.outcome, done.inserted)
+		cycle.Requests += done.outcome.Requests
+		cycle.Timeouts += done.outcome.Timeouts
 		guard.Unlock()
-		at := time.Now().Format(time.RFC3339)
 		tail := done.outcome.Reason
 		if tail == "" {
 			tail = gathered(&done.site)
 		}
-		fmt.Printf("%s [%s] %s %s\n", at, done.site.State, done.site.Host, tail)
+		fmt.Printf("%s [%s] %s %s\n", time.Now().Format(time.RFC3339), done.site.State, done.site.Host, tail)
 	}
 
-	running := true
-	for running && task.Err() == nil {
+	wait := func(limit time.Duration) bool {
+		var due <-chan time.Time
+		if limit > 0 {
+			timer := time.NewTimer(limit)
+			defer timer.Stop()
+			due = timer.C
+		}
+		select {
+		case <-task.Done():
+			return false
+		case done := <-results:
+			handle(done)
+		case <-due:
+		case <-tuneTicker.C:
+			knob.tune(takeWindow(&cycle, &guard))
+		}
+		return true
+	}
+
+	for running := true; running && task.Err() == nil; {
 		guard.Lock()
 		pending := len(inflight)
-		busy := make([]string, 0, pending)
-		for host := range inflight {
-			busy = append(busy, host)
-		}
+		busy := slices.Collect(maps.Keys(inflight))
 		guard.Unlock()
 
-		if want := knob.workers() - pending; want > 0 {
+		if want := int(atomic.LoadInt32(&knob.worker)) - pending; want > 0 {
 			batch, failure := table.Dequeue(time.Now().UTC(), want, busy)
 			if failure != nil {
 				fmt.Fprintf(os.Stderr, "取站失败：%v\n", failure)
 				break
 			}
 			if len(batch) == 0 {
-				timer := time.NewTimer(table.NextDue(time.Now().UTC()))
-				select {
-				case <-task.Done():
-					timer.Stop()
-					running = false
-				case <-timer.C:
-				case done := <-results:
-					timer.Stop()
-					handle(done)
-				case <-tuneTicker.C:
-					timer.Stop()
-					knob.tune(takeWindow(&cycle, &guard))
-				case <-reportTicker.C:
-					timer.Stop()
-					report(knob, &window, &guard, round, time.Since(mark))
-					mark, round = time.Now(), round+1
-				}
+				running = wait(table.NextDue(time.Now().UTC()))
 				continue
 			}
 			for _, site := range batch {
@@ -640,17 +596,7 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 			}
 			continue
 		}
-		select {
-		case <-task.Done():
-			running = false
-		case done := <-results:
-			handle(done)
-		case <-tuneTicker.C:
-			knob.tune(takeWindow(&cycle, &guard))
-		case <-reportTicker.C:
-			report(knob, &window, &guard, round, time.Since(mark))
-			mark, round = time.Now(), round+1
-		}
+		running = wait(0)
 	}
 
 	close(jobs)
@@ -666,31 +612,16 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 	return nil
 }
 
-func report(knob *tuner, tally *BatchTally, guard *sync.Mutex, round int, elapsed time.Duration) {
-	count := takeWindow(tally, guard)
-	if count.Sites == 0 {
-		return
-	}
-	mean := int64(0)
-	if count.Requests > 0 {
-		mean = (count.Latency / time.Duration(count.Requests)).Milliseconds()
-	}
-	fmt.Printf("第 %d 轮：新增 %d 站（%d 线程，共请求 %d 次 / %d Byte，平均 %.1f 站/秒 / 时延 %d MS）\n",
-		round, count.Expanded, knob.workers(), count.Requests, count.Bytes,
-		float64(count.Sites)/elapsed.Seconds(), mean)
-}
-
 func gathered(site *Site) string {
-	items := [][2]string{{"名称", site.Name}, {"作者", site.Author},
-		{"语言", site.Language}, {"框架", site.Framework}, {"订阅", site.Feed}}
-	parts := make([]string, 0, len(items))
-	for _, item := range items {
+	parts := make([]string, 0, 9)
+	for _, item := range [][2]string{
+		{"feed", site.Feed}, {"lang", site.Language}, {"name", site.Name},
+		{"author", site.Author}, {"icp", site.ICP}, {"summary", site.Summary},
+		{"tag", site.Tags}, {"friend", site.Friend}, {"framework", site.Framework},
+	} {
 		if item[1] != "" {
-			parts = append(parts, item[0]+item[1])
+			parts = append(parts, item[0]+"="+item[1])
 		}
 	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "、" + strings.Join(parts, "、")
+	return strings.Join(parts, " ")
 }
