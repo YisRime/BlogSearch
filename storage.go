@@ -5,16 +5,18 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	_ "modernc.org/sqlite"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
+//go:embed schema.sql
 var schemaSQL string
 
-type Site struct {
+type BlogSite struct {
 	Host      string
 	Feed      string
 	Language  string
@@ -26,6 +28,7 @@ type Site struct {
 	Friend    string
 	Framework string
 	State     string
+	Retry     int
 	Cert      bool
 	CheckAt   string
 }
@@ -35,11 +38,7 @@ type BlogTable struct {
 	write    *sql.Stmt
 }
 
-func placeholders(count int) string {
-	return "(?" + strings.Repeat(",?", count-1) + ")"
-}
-
-func OpenBlogTable(path string) (*BlogTable, error) {
+func openTable(path string) (*BlogTable, error) {
 	if directory := filepath.Dir(path); directory != "" && directory != "." {
 		if failure := os.MkdirAll(directory, 0o755); failure != nil {
 			return nil, failure
@@ -58,51 +57,45 @@ func OpenBlogTable(path string) (*BlogTable, error) {
 		connection.Close()
 		return nil, failure
 	}
-	write, failure := connection.Prepare(`INSERT INTO blog (host,feed,lang,name,author,icp,summary,tag,friend,framework,state,cert,check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+	upsert, failure := connection.Prepare(`INSERT INTO blog (host,feed,lang,name,author,icp,summary,tag,friend,framework,state,retry,cert,check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(host) DO UPDATE SET feed=excluded.feed,lang=excluded.lang,name=excluded.name,author=excluded.author,
 	icp=excluded.icp,summary=excluded.summary,tag=excluded.tag,friend=excluded.friend,framework=excluded.framework,
-	state=excluded.state,cert=excluded.cert,check_at=excluded.check_at`)
+	state=excluded.state,retry=excluded.retry,cert=excluded.cert,check_at=excluded.check_at`)
 	if failure != nil {
 		connection.Close()
 		return nil, failure
 	}
-	return &BlogTable{database: connection, write: write}, nil
+	return &BlogTable{database: connection, write: upsert}, nil
 }
 
-func (table *BlogTable) Enqueue(hosts []string, now time.Time) {
+func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	stamp := now.Format(time.RFC3339)
-	failure := func() error {
-		transaction, failure := table.database.Begin()
-		if failure != nil {
-			return failure
+	valid := make([]string, 0, len(hosts))
+	for _, raw := range hosts {
+		if host := HostOf(raw); host != "" {
+			valid = append(valid, host)
 		}
-		defer transaction.Rollback()
-		statement, failure := transaction.Prepare(`INSERT INTO blog (host, state, create_at, check_at) VALUES (?,?,?,?)
-		ON CONFLICT(host) DO NOTHING`)
-		if failure != nil {
-			return failure
+	}
+	for start := 0; start < len(valid); start += 256 {
+		batch := valid[start:min(start+256, len(valid))]
+		arguments := make([]any, 0, len(batch)*4)
+		for _, host := range batch {
+			arguments = append(arguments, host, "pend", stamp, stamp)
 		}
-		defer statement.Close()
-		for _, raw := range hosts {
-			if host := Judge(raw); host != "" {
-				if _, failure := statement.Exec(host, "pend", stamp, stamp); failure != nil {
-					return failure
-				}
-			}
+		query := `INSERT INTO blog (host, state, create_at, check_at) VALUES ` +
+			strings.TrimSuffix(strings.Repeat(slots(4)+",", len(batch)), ",") + ` ON CONFLICT(host) DO NOTHING`
+		if _, failure := table.database.Exec(query, arguments...); failure != nil {
+			fmt.Fprintf(os.Stderr, "写入失败：外链 %v", failure)
 		}
-		return transaction.Commit()
-	}()
-	if failure != nil {
-		fmt.Fprintf(os.Stderr, "写入失败：外链 %v", failure)
 	}
 }
 
-func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site, error) {
-	query := `SELECT host,feed,lang,name,author,icp,summary,tag,friend,framework,state,cert,check_at FROM blog
+func (table *BlogTable) claimDue(now time.Time, batch int, busy []string) ([]BlogSite, error) {
+	query := `SELECT host,feed,lang,name,author,icp,summary,tag,friend,framework,state,retry,cert,check_at FROM blog
 		WHERE check_at<>'' AND check_at<=?`
 	arguments := []any{now.Format(time.RFC3339)}
 	if len(busy) > 0 {
-		query += ` AND host NOT IN ` + placeholders(len(busy))
+		query += ` AND host NOT IN ` + slots(len(busy))
 		for _, host := range busy {
 			arguments = append(arguments, host)
 		}
@@ -112,12 +105,12 @@ func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site
 		return nil, failure
 	}
 	defer rows.Close()
-	var sites []Site
+	var sites []BlogSite
 	for rows.Next() {
-		site := Site{}
+		site := BlogSite{}
 		var cert int
 		if failure := rows.Scan(&site.Host, &site.Feed, &site.Language, &site.Name, &site.Author, &site.ICP,
-			&site.Summary, &site.Tags, &site.Friend, &site.Framework, &site.State, &cert, &site.CheckAt); failure != nil {
+			&site.Summary, &site.Tags, &site.Friend, &site.Framework, &site.State, &site.Retry, &cert, &site.CheckAt); failure != nil {
 			return nil, failure
 		}
 		site.Cert = cert != 0
@@ -126,7 +119,7 @@ func (table *BlogTable) Dequeue(now time.Time, batch int, busy []string) ([]Site
 	return sites, rows.Err()
 }
 
-func (table *BlogTable) NextDue(now time.Time) time.Duration {
+func (table *BlogTable) nextWake(now time.Time) time.Duration {
 	var text sql.NullString
 	failure := table.database.QueryRow(`SELECT MIN(check_at) FROM blog WHERE check_at<>'' AND check_at>?`,
 		now.Format(time.RFC3339)).Scan(&text)
@@ -137,11 +130,11 @@ func (table *BlogTable) NextDue(now time.Time) time.Duration {
 	return min(max(time.Until(when), 5*time.Second), 5*time.Minute)
 }
 
-func (table *BlogTable) FriendOrdinals(hosts []string) string {
+func (table *BlogTable) friendIndex(hosts []string) string {
 	seen := map[string]bool{}
 	keys := make([]string, 0, len(hosts))
 	for _, raw := range hosts {
-		host := Judge(raw)
+		host := HostOf(raw)
 		if host == "" || seen[host] {
 			continue
 		}
@@ -155,7 +148,7 @@ func (table *BlogTable) FriendOrdinals(hosts []string) string {
 	for index, host := range keys {
 		arguments[index] = host
 	}
-	rows, failure := table.database.Query(`SELECT host,rowid FROM blog WHERE host IN `+placeholders(len(keys)), arguments...)
+	rows, failure := table.database.Query(`SELECT host,rowid FROM blog WHERE host IN `+slots(len(keys)), arguments...)
 	if failure != nil {
 		return ""
 	}
@@ -185,38 +178,39 @@ func (table *BlogTable) FriendOrdinals(hosts []string) string {
 	return string(text)
 }
 
-func (table *BlogTable) Save(site *Site, outcome Outcome) {
+func (table *BlogTable) persist(site *BlogSite, result Result) {
 	now := time.Now().UTC()
 	schedule := func(delay time.Duration) { site.CheckAt = now.Add(delay).Format(time.RFC3339) }
-	switch outcome.State {
+	switch result.State {
 	case "alive":
-		site.State = "alive"
+		site.State, site.Retry = "alive", 0
 		for _, pair := range [][2]*string{
-			{&site.Name, &outcome.Name}, {&site.Author, &outcome.Author}, {&site.Feed, &outcome.Feed},
-			{&site.Language, &outcome.Language}, {&site.Framework, &outcome.Framework},
-			{&site.ICP, &outcome.ICP}, {&site.Summary, &outcome.Summary}, {&site.Friend, &outcome.Friend},
+			{&site.Name, &result.Name}, {&site.Author, &result.Author}, {&site.Feed, &result.Feed},
+			{&site.Language, &result.Language}, {&site.Framework, &result.Framework},
+			{&site.ICP, &result.ICP}, {&site.Summary, &result.Summary}, {&site.Friend, &result.Friend},
 		} {
 			if *pair[1] != "" {
 				*pair[0] = *pair[1]
 			}
 		}
 		delay := 30 * 24 * time.Hour
-		if margin := outcome.CertEnd.Sub(now) - 3*24*time.Hour; !outcome.CertEnd.IsZero() && margin > 0 && margin < delay {
+		if margin := result.CertEnd.Sub(now) - 3*24*time.Hour; !result.CertEnd.IsZero() && margin > 0 && margin < delay {
 			delay = margin
 		}
 		schedule(delay)
 	case "other", "dead":
-		site.State, site.CheckAt = outcome.State, ""
+		site.State, site.CheckAt, site.Retry = result.State, "", 0
 	default:
-		if site.State == "alive" {
-			schedule(24 * time.Hour)
+		site.Retry++
+		if site.Retry >= 3 {
+			site.State, site.CheckAt = "fail", ""
 		} else {
-			site.State, site.CheckAt = "dead", ""
+			schedule(24 * time.Hour)
 		}
 	}
-	site.Cert = site.Cert || outcome.Cert
+	site.Cert = site.Cert || result.Cert
 	if _, failure := table.write.Exec(site.Host, site.Feed, site.Language, site.Name, site.Author, site.ICP,
-		site.Summary, site.Tags, site.Friend, site.Framework, site.State, site.Cert, site.CheckAt); failure != nil {
+		site.Summary, site.Tags, site.Friend, site.Framework, site.State, site.Retry, site.Cert, site.CheckAt); failure != nil {
 		fmt.Fprintf(os.Stderr, "写入 %s 失败：%v", site.Host, failure)
 	}
 }

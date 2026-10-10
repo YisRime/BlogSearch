@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS blog (
  friend    TEXT NOT NULL DEFAULT '',
  framework TEXT NOT NULL DEFAULT '',
  state     TEXT NOT NULL DEFAULT 'pend',
+ retry     INTEGER NOT NULL DEFAULT 0,
  cert      INTEGER NOT NULL DEFAULT 0,
  create_at TEXT NOT NULL DEFAULT '',
  check_at  TEXT NOT NULL DEFAULT ''

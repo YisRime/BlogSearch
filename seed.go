@@ -44,6 +44,25 @@ func downloadSeed(target string) ([]byte, error) {
 	return nil, last
 }
 
+func seedHost(raw string) string {
+	host := normalizeHost(raw)
+	if host == "" {
+		return ""
+	}
+	host = HostOf(host)
+	if host == "" {
+		return ""
+	}
+	registrable := registrableOf(host)
+	if registrable == "" || (host != registrable && host != "blog."+registrable) {
+		return ""
+	}
+	if hubHosts[registrable] {
+		return ""
+	}
+	return host
+}
+
 func SeedBlogs(table *BlogTable) error {
 	body, failure := downloadSeed("https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json")
 	if failure != nil {
@@ -79,7 +98,7 @@ func SeedBlogs(table *BlogTable) error {
 	seen := map[string]bool{}
 	inserted, existing, skipped := 0, 0, 0
 	for _, entry := range document.Blogs {
-		host := HostOf(entry.URL)
+		host := seedHost(entry.URL)
 		if host == "" || seen[host] {
 			skipped++
 			continue

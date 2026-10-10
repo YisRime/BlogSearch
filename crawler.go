@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"golang.org/x/net/html/charset"
 	"io"
 	"maps"
 	"net"
@@ -21,9 +20,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/html/charset"
 )
 
-type PageReply struct {
+type Reply struct {
 	Status   int
 	Body     []byte
 	Location string
@@ -31,7 +32,7 @@ type PageReply struct {
 	CertEnd  time.Time
 }
 
-type Outcome struct {
+type Result struct {
 	State     string
 	Reason    string
 	Links     []string
@@ -50,12 +51,12 @@ type Outcome struct {
 	Summary   string
 }
 
-type BatchTally struct {
+type Tally struct {
 	Requests int
 	Timeouts int
 }
 
-type Crawler struct {
+type Scout struct {
 	client      *http.Client
 	follower    *http.Client
 	loose       *http.Client
@@ -66,7 +67,12 @@ type Crawler struct {
 	learned map[string]string
 }
 
-func newTransport(relaxed bool, maxConns, perHost int) *http.Transport {
+type hostSet struct {
+	seen  map[string]bool
+	items []string
+}
+
+func dialer(relaxed bool, maxConns, perHost int) *http.Transport {
 	return &http.Transport{
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
@@ -78,55 +84,68 @@ func newTransport(relaxed bool, maxConns, perHost int) *http.Transport {
 	}
 }
 
-func NewCrawler() *Crawler {
+func newScout() *Scout {
 	floor := runtime.GOMAXPROCS(0)
 	ceiling := floor * 4
-	strict, relaxed := newTransport(false, ceiling, floor), newTransport(true, ceiling, floor)
-	hold := func(transport *http.Transport) *http.Client {
-		return &http.Client{Transport: transport, Timeout: 60 * time.Second,
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	strict, relaxed := dialer(false, ceiling, floor), dialer(true, ceiling, floor)
+	build := func(transport *http.Transport, redirect bool) *http.Client {
+		client := &http.Client{Transport: transport, Timeout: 60 * time.Second}
+		if redirect {
+			client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+		}
+		return client
 	}
-	pass := func(transport *http.Transport) *http.Client {
-		return &http.Client{Transport: transport, Timeout: 60 * time.Second}
-	}
-	return &Crawler{
-		client: hold(strict), follower: pass(strict), loose: hold(relaxed), looseFollow: pass(relaxed),
+	return &Scout{
+		client: build(strict, true), follower: build(strict, false),
+		loose: build(relaxed, true), looseFollow: build(relaxed, false),
 		latency: 4, learned: map[string]string{},
 	}
 }
 
-func (crawler *Crawler) Timeout() time.Duration {
-	crawler.guard.Lock()
-	latency := crawler.latency
-	crawler.guard.Unlock()
+func (scout *Scout) Timeout() time.Duration {
+	scout.guard.Lock()
+	latency := scout.latency
+	scout.guard.Unlock()
 	return min(max(time.Duration(4*latency*float64(time.Second)), 10*time.Second), 60*time.Second)
 }
 
-func (crawler *Crawler) recall(key string) string {
-	crawler.guard.Lock()
-	defer crawler.guard.Unlock()
-	return crawler.learned[key]
+func (scout *Scout) lookup(key string) string {
+	scout.guard.Lock()
+	defer scout.guard.Unlock()
+	return scout.learned[key]
 }
 
-func (crawler *Crawler) memorize(key, target string) {
+func (scout *Scout) remember(key, target string) {
 	parsed, failure := url.Parse(target)
 	if failure != nil || parsed.Path == "" {
 		return
 	}
-	crawler.guard.Lock()
-	crawler.learned[key] = parsed.Path
-	crawler.guard.Unlock()
+	scout.guard.Lock()
+	scout.learned[key] = parsed.Path
+	scout.guard.Unlock()
 }
 
-func (crawler *Crawler) fetch(task context.Context, target string, follow, relaxed bool) (*PageReply, error) {
-	client := crawler.client
+func decodeBody(body []byte, contentType string) []byte {
+	reader, failure := charset.NewReader(bytes.NewReader(body), contentType)
+	if failure != nil {
+		return body
+	}
+	text, failure := io.ReadAll(reader)
+	if failure != nil || len(text) == 0 {
+		return body
+	}
+	return text
+}
+
+func (scout *Scout) fetch(task context.Context, target string, follow, relaxed bool) (*Reply, error) {
+	client := scout.client
 	switch {
 	case relaxed && follow:
-		client = crawler.looseFollow
+		client = scout.looseFollow
 	case relaxed:
-		client = crawler.loose
+		client = scout.loose
 	case follow:
-		client = crawler.follower
+		client = scout.follower
 	}
 	request, failure := http.NewRequestWithContext(task, http.MethodGet, target, nil)
 	if failure != nil {
@@ -139,13 +158,7 @@ func (crawler *Crawler) fetch(task context.Context, target string, follow, relax
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	decoded := body
-	if reader, failure := charset.NewReader(bytes.NewReader(body), response.Header.Get("Content-Type")); failure == nil {
-		if text, failure := io.ReadAll(reader); failure == nil && len(text) > 0 {
-			decoded = text
-		}
-	}
-	reply := &PageReply{Status: response.StatusCode, Body: decoded,
+	reply := &Reply{Status: response.StatusCode, Body: decodeBody(body, response.Header.Get("Content-Type")),
 		Location: strings.TrimSpace(response.Header.Get("Location")),
 		Language: strings.TrimSpace(response.Header.Get("Content-Language"))}
 	if response.TLS != nil && len(response.TLS.PeerCertificates) > 0 {
@@ -154,34 +167,33 @@ func (crawler *Crawler) fetch(task context.Context, target string, follow, relax
 	return reply, nil
 }
 
-func (crawler *Crawler) attempt(task context.Context, outcome *Outcome, target string, follow, relaxed bool) (*PageReply, error) {
+func (scout *Scout) tryPage(task context.Context, result *Result, target string, follow, relaxed bool) (*Reply, error) {
 	started := time.Now()
-	reply, failure := crawler.fetch(task, target, follow, relaxed)
+	reply, failure := scout.fetch(task, target, follow, relaxed)
 	elapsed := time.Since(started)
-	outcome.Requests++
+	result.Requests++
 	if failure == nil {
-		crawler.guard.Lock()
-		crawler.latency += (elapsed.Seconds() - crawler.latency) * 0.1
-		crawler.guard.Unlock()
+		scout.guard.Lock()
+		scout.latency += (elapsed.Seconds() - scout.latency) * 0.1
+		scout.guard.Unlock()
 		return reply, nil
 	}
 	var timeout interface{ Timeout() bool }
-	if errors.Is(failure, context.DeadlineExceeded) ||
-		(errors.As(failure, &timeout) && timeout.Timeout()) {
-		outcome.Timeouts++
+	if errors.Is(failure, context.DeadlineExceeded) || (errors.As(failure, &timeout) && timeout.Timeout()) {
+		result.Timeouts++
 	}
 	return reply, failure
 }
 
-func (crawler *Crawler) fetchEither(task context.Context, outcome *Outcome, target string, follow bool) (*PageReply, string, error) {
-	reply, failure := crawler.attempt(task, outcome, target, follow, false)
+func (scout *Scout) tryEither(task context.Context, result *Result, target string, follow bool) (*Reply, string, error) {
+	reply, failure := scout.tryPage(task, result, target, follow, false)
 	if failure == nil {
 		return reply, target, nil
 	}
 	var certFailure *tls.CertificateVerificationError
 	if errors.As(failure, &certFailure) {
-		outcome.Cert = true
-		if reply, failure = crawler.attempt(task, outcome, target, follow, true); failure == nil {
+		result.Cert = true
+		if reply, failure = scout.tryPage(task, result, target, follow, true); failure == nil {
 			return reply, target, nil
 		}
 	}
@@ -194,54 +206,46 @@ func (crawler *Crawler) fetchEither(task context.Context, outcome *Outcome, targ
 	if fallback == "" || (!refused && !closed) {
 		return nil, target, failure
 	}
-	reply, failure = crawler.attempt(task, outcome, fallback, follow, false)
+	reply, failure = scout.tryPage(task, result, fallback, follow, false)
 	return reply, fallback, failure
 }
 
-func (crawler *Crawler) probe(task context.Context, outcome *Outcome, candidates []string) (*PageReply, string) {
+func (scout *Scout) pick(task context.Context, result *Result, candidates []string, accept func(*Reply, string) bool) (*Reply, string, string) {
+	reason := ""
 	for _, candidate := range candidates {
-		reply, target, failure := crawler.fetchEither(task, outcome, candidate, true)
-		if failure != nil || reply.Status != http.StatusOK {
+		if candidate == "" {
 			continue
 		}
-		return reply, target
+		reply, target, failure := scout.tryEither(task, result, candidate, true)
+		if failure != nil {
+			if reason == "" {
+				reason = failure.Error()
+			}
+			continue
+		}
+		if reply.Status != http.StatusOK {
+			if reason == "" {
+				reason = strconv.Itoa(reply.Status)
+			}
+			continue
+		}
+		if accept == nil || accept(reply, target) {
+			return reply, target, ""
+		}
 	}
-	return nil, ""
+	return nil, "", reason
 }
 
-func fail(outcome *Outcome, state, reason, payload string) {
-	outcome.State = state
+func mark(result *Result, state, reason, payload string) {
+	result.State = state
 	if payload == "" {
-		outcome.Reason = reason
+		result.Reason = reason
 		return
 	}
-	outcome.Reason = reason + "：" + payload
+	result.Reason = reason + "：" + payload
 }
 
-var hubHosts = map[string]bool{
-	"github.com": true, "zhihu.com": true, "weibo.com": true, "csdn.net": true,
-	"jianshu.com": true, "facebook.com": true, "twitter.com": true, "x.com": true,
-	"youtube.com": true, "medium.com": true, "douban.com": true, "bilibili.com": true,
-	"linkedin.com": true, "instagram.com": true, "pinterest.com": true, "reddit.com": true,
-	"tumblr.com": true, "wordpress.com": true, "blogspot.com": true, "wanandroid.com": true,
-	"ituring.com.cn": true, "foreverblog.cn": true, "storeweb.cn": true,
-	"listbox.app": true, "urschool.org": true, "cafenomad.tw": true,
-}
-
-func notBlog(site *Site, page Page, outcome *Outcome) bool {
-	if outcome.Feed != "" || site.Feed != "" || outcome.Framework != "" || outcome.ICP != "" ||
-		page.HasArchive || len(outcome.Friends) > 0 {
-		return false
-	}
-	mark := strings.ToLower(collapse(page.Name))
-	return hubHosts[registrableOf(site.Host)] || mark == "" || mark == "首页" || mark == "home" ||
-		slices.ContainsFunc([]string{"index of", "网站维护中", "建站中", "维护中", "coming soon",
-			"域名出售", "域名停放", "网址导航", "搜索引擎"}, func(word string) bool {
-			return strings.Contains(mark, word)
-		})
-}
-
-func pathsOn(host string, guesses []string) []string {
+func siteURLs(host string, guesses []string) []string {
 	addresses := make([]string, 0, len(guesses))
 	for _, guess := range guesses {
 		addresses = append(addresses, "https://"+host+guess)
@@ -249,55 +253,50 @@ func pathsOn(host string, guesses []string) []string {
 	return addresses
 }
 
-type collector struct {
-	seen  map[string]bool
-	items []string
-}
-
-func (collector *collector) add(raw string) string {
+func (set *hostSet) keep(raw string) string {
 	hostname := normalizeHost(raw)
-	if hostname == "" || collector.seen[hostname] {
+	if hostname == "" || set.seen[hostname] {
 		return ""
 	}
-	collector.seen[hostname] = true
-	collector.items = append(collector.items, hostname)
+	set.seen[hostname] = true
+	set.items = append(set.items, hostname)
 	return hostname
 }
 
-func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome, registrable string, collector *collector) (Page, bool) {
+func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, registrable string, hosts *hostSet) (Home, bool) {
 	dead := func(failure error) {
 		record := &net.DNSError{}
 		rejected := errors.As(failure, &record) && !record.IsTemporary &&
 			(record.IsNotFound || strings.Contains(record.Err, "no data"))
 		if rejected {
-			outcome.State, outcome.Reason = "dead", "地址无效"
+			result.State, result.Reason = "dead", "地址无效"
 			return
 		}
-		fail(outcome, "pend", "抓取失败", failure.Error())
+		mark(result, "pend", "抓取失败", failure.Error())
 	}
 	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
 	if failure != nil {
 		dead(failure)
-		return Page{}, false
+		return Home{}, false
 	}
 	if len(addresses) == 0 {
-		fail(outcome, "dead", "地址无效", "")
-		return Page{}, false
+		mark(result, "dead", "地址无效", "")
+		return Home{}, false
 	}
 	target := "https://" + site.Host + "/"
 	tried := map[string]bool{target: true}
-	var reply *PageReply
-	for hop := 0; hop <= 4; hop++ {
+	var reply *Reply
+	for hop := 0; hop <= 3; hop++ {
 		wanted := target
-		var failure error
-		reply, target, failure = crawler.fetchEither(task, outcome, target, false)
+		var hopFailure error
+		reply, target, hopFailure = scout.tryEither(task, result, target, false)
 		tried[wanted], tried[target] = true, true
-		if failure != nil {
-			dead(failure)
-			return Page{}, false
+		if hopFailure != nil {
+			dead(hopFailure)
+			return Home{}, false
 		}
 		if !reply.CertEnd.IsZero() {
-			outcome.CertEnd = reply.CertEnd
+			result.CertEnd = reply.CertEnd
 		}
 		if reply.Status < 300 || reply.Status >= 400 {
 			break
@@ -309,69 +308,69 @@ func (crawler *Crawler) home(task context.Context, site *Site, outcome *Outcome,
 			}
 		}
 		hostname := normalizeHost(next)
-		if tried[next] || hostname == "" {
-			fail(outcome, "pend", "地址无效", "")
-			return Page{}, false
+		if hostname == "" {
+			mark(result, "pend", "地址无效", "")
+			return Home{}, false
 		}
-		collector.add(hostname)
+		if tried[next] {
+			mark(result, "pend", "跳转过多", "")
+			return Home{}, false
+		}
+		hosts.keep(hostname)
 		if registrableOf(hostname) != registrable {
-			outcome.State, outcome.Links = "dead", collector.items
-			return Page{}, false
+			result.State, result.Links = "dead", hosts.items
+			return Home{}, false
 		}
-		if hop < 4 {
+		if hop < 3 {
 			target = next
 			continue
 		}
-		fail(outcome, "pend", "地址无效", "")
-		return Page{}, false
+		mark(result, "pend", "跳转过多", "")
+		return Home{}, false
 	}
 	if reply.Status >= 400 {
-		fail(outcome, "pend", "应答失败", strconv.Itoa(reply.Status))
-		return Page{}, false
+		mark(result, "pend", "应答失败", strconv.Itoa(reply.Status))
+		return Home{}, false
 	}
-	page := ParsePage(reply.Body, target)
-	title := strings.ToLower(collapse(page.Name))
-	if slices.ContainsFunc([]string{"404", "not found", "页面不存在", "找不到页面", "access denied",
-		"welcome to nginx", "index of /", "default web site page", "站点未找到"},
-		func(mark string) bool { return strings.Contains(title, mark) }) {
-		fail(outcome, "pend", "应答失败", "200")
-		return Page{}, false
+	page := readPage(reply.Body, target)
+	if errorPage(page.Name) {
+		state := "other"
+		if site.State == "alive" {
+			state = "pend"
+		}
+		mark(result, state, "错误页", "200")
+		return Home{}, false
 	}
-	outcome.Name, outcome.Author, outcome.Language, outcome.Framework = page.Name, page.Author, page.Language, page.Framework
-	outcome.ICP, outcome.Summary = page.ICP, page.Summary
-	if outcome.Language == "" {
-		outcome.Language = reply.Language
+	result.Name, result.Author, result.Language, result.Framework = page.Name, page.Author, page.Language, page.Framework
+	result.ICP, result.Summary = page.ICP, page.Summary
+	if result.Language == "" {
+		result.Language = reply.Language
 	}
 	return page, true
 }
 
-func (crawler *Crawler) expand(task context.Context, site *Site, page Page, outcome *Outcome, registrable string, collector *collector) {
+func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, result *Result, registrable string, hosts *hostSet) {
 	if hubHosts[registrable] {
 		return
 	}
 	guesses := []string{"/links", "/friends", "/link", "/blogroll", "/friend", "/links/", "/link.html"}
 	friends := make([]string, 0, len(page.Friends)+len(guesses))
 	friends = append(friends, page.Friends...)
-	friends = append(friends, pathsOn(site.Host, guesses)...)
-	if reply, target := crawler.probe(task, outcome, friends); reply != nil {
-		added := 0
-		for _, link := range ParsePage(reply.Body, target).Links {
-			if added >= 60 {
-				break
-			}
+	friends = append(friends, siteURLs(site.Host, guesses)...)
+	if reply, target, _ := scout.pick(task, result, friends, nil); reply != nil {
+		for _, link := range readPage(reply.Body, target).Links {
 			neighbor := registrableOf(link)
 			if neighbor == registrable || hubHosts[neighbor] {
 				continue
 			}
-			if host := collector.add(link); host != "" {
-				outcome.Friends = append(outcome.Friends, host)
-				added++
+			if host := hosts.keep(link); host != "" {
+				result.Friends = append(result.Friends, host)
 			}
 		}
 	}
 }
 
-func (crawler *Crawler) subscribe(task context.Context, site *Site, page Page, outcome *Outcome) {
+func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, result *Result) {
 	key := page.Framework
 	if key == "" {
 		key = "default"
@@ -386,130 +385,129 @@ func (crawler *Crawler) subscribe(task context.Context, site *Site, page Page, o
 	if site.Feed != "" {
 		candidates = append(candidates, site.Feed)
 	}
-	if recalled := crawler.recall("feed:" + key); recalled != "" {
+	if recalled := scout.lookup("feed:" + key); recalled != "" {
 		candidates = append(candidates, "https://"+site.Host+recalled)
 	}
-	if page.Feed != site.Feed {
+	if site.Feed == "" || page.Feed != site.Feed {
 		if page.Feed != "" {
 			candidates = append(candidates, page.Feed)
 		}
-		candidates = append(candidates, pathsOn(site.Host, guesses)...)
+		candidates = append(candidates, siteURLs(site.Host, guesses)...)
 	}
-	reason := ""
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		reply, target, failure := crawler.fetchEither(task, outcome, candidate, true)
-		if failure != nil {
-			if reason == "" {
-				reason = failure.Error()
-			}
-			continue
-		}
-		if reply.Status != http.StatusOK {
-			if reason == "" {
-				reason = strconv.Itoa(reply.Status)
-			}
-			continue
-		}
-		subscription := ParseSubscription(reply.Body)
-		if !subscription.Parsed {
-			continue
-		}
-		outcome.Feed = target
-		crawler.memorize("feed:"+key, target)
-		reason = ""
+	var subscription Feed
+	reply, target, reason := scout.pick(task, result, candidates, func(reply *Reply, _ string) bool {
+		subscription = ParseSubscription(reply.Body)
+		return subscription.Parsed
+	})
+	if reply != nil {
+		result.Feed = target
+		scout.remember("feed:"+key, target)
 		if subscription.Name != "" {
-			outcome.Name = subscription.Name
+			result.Name = subscription.Name
 		}
 		if len(subscription.Authors) == 1 {
-			outcome.Author = subscription.Authors[0]
+			result.Author = subscription.Authors[0]
 		}
 		if subscription.Language != "" {
-			outcome.Language = subscription.Language
+			result.Language = subscription.Language
 		}
-		break
+		return
 	}
 	if reason != "" {
-		fail(outcome, "alive", "订阅失败", reason)
+		mark(result, "alive", "订阅失败", reason)
 	}
 }
 
-func (crawler *Crawler) Crawl(task context.Context, site *Site, full bool) Outcome {
-	outcome := Outcome{State: "alive"}
-	collector := &collector{seen: map[string]bool{site.Host: true}}
+func (scout *Scout) inspect(task context.Context, site *BlogSite, full bool) Result {
+	result := Result{State: "alive"}
+	hosts := &hostSet{seen: map[string]bool{site.Host: true}}
 	registrable := registrableOf(site.Host)
-	page, reached := crawler.home(task, site, &outcome, registrable, collector)
+	page, reached := scout.home(task, site, &result, registrable, hosts)
 	if !reached {
-		return outcome
+		return result
 	}
 	if full {
-		crawler.subscribe(task, site, page, &outcome)
-		candidates := pathsOn(site.Host, []string{"/sitemap.xml", "/sitemap_index.xml"})
-		if recalled := crawler.recall("sitemap"); recalled != "" {
+		scout.subscribe(task, site, page, &result)
+		candidates := siteURLs(site.Host, []string{"/sitemap.xml", "/sitemap_index.xml"})
+		if recalled := scout.lookup("sitemap"); recalled != "" {
 			candidates = append([]string{"https://" + site.Host + recalled}, candidates...)
 		}
-		if reply, target := crawler.probe(task, &outcome, candidates); reply != nil {
+		if reply, target, _ := scout.pick(task, &result, candidates, nil); reply != nil {
 			for _, link := range ParseSitemap(reply.Body) {
 				if hubHosts[registrableOf(link)] {
 					continue
 				}
-				collector.add(link)
+				hosts.keep(link)
 			}
-			crawler.memorize("sitemap", target)
+			scout.remember("sitemap", target)
 		}
 	}
-	crawler.expand(task, site, page, &outcome, registrable, collector)
-	outcome.Links = collector.items
-	if notBlog(site, page, &outcome) || (page.SinglePost && !page.HasArchive) {
-		outcome.State, outcome.Reason = "other", "非博客"
+	if full || site.Friend == "" {
+		scout.expand(task, site, page, &result, registrable, hosts)
 	}
-	return outcome
+	result.Links = hosts.items
+	if notBlog(site, page, &result) || (page.SinglePost && !page.HasArchive) {
+		result.State, result.Reason = "other", "非博客"
+	}
+	return result
 }
 
-type tuner struct {
+type governor struct {
 	guard   sync.Mutex
 	worker  int32
 	floor   int32
 	ceiling int32
 }
 
-func (tuner *tuner) tune(count BatchTally) {
+type finished struct {
+	site   BlogSite
+	result Result
+}
+
+func (knob *governor) tune(count Tally) {
 	if count.Requests == 0 {
 		return
 	}
-	tuner.guard.Lock()
-	defer tuner.guard.Unlock()
-	worker := int(atomic.LoadInt32(&tuner.worker))
+	knob.guard.Lock()
+	defer knob.guard.Unlock()
+	worker := int(atomic.LoadInt32(&knob.worker))
 	switch ratio := float64(count.Timeouts) / float64(count.Requests); {
 	case ratio > 0.10:
 		worker /= 2
 	case ratio < 0.05:
 		worker += 4
 	}
-	atomic.StoreInt32(&tuner.worker, int32(min(max(worker, int(tuner.floor)), int(tuner.ceiling))))
+	atomic.StoreInt32(&knob.worker, int32(min(max(worker, int(knob.floor)), int(knob.ceiling))))
 }
 
-type completed struct {
-	site    Site
-	outcome Outcome
-}
-
-func takeWindow(tally *BatchTally, guard *sync.Mutex) BatchTally {
+func takeWindow(tally *Tally, guard *sync.Mutex) Tally {
 	guard.Lock()
 	snapshot := *tally
-	*tally = BatchTally{}
+	*tally = Tally{}
 	guard.Unlock()
 	return snapshot
 }
 
-func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) error {
+func gathered(site *BlogSite) string {
+	parts := make([]string, 0, 9)
+	for _, item := range [][2]string{
+		{"feed", site.Feed}, {"lang", site.Language}, {"name", site.Name},
+		{"author", site.Author}, {"icp", site.ICP}, {"summary", site.Summary},
+		{"tag", site.Tags}, {"friend", site.Friend}, {"framework", site.Framework},
+	} {
+		if item[1] != "" {
+			parts = append(parts, item[0]+"="+item[1])
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func runCrawl(task context.Context, table *BlogTable, scout *Scout) error {
 	floor := int32(runtime.GOMAXPROCS(0))
-	knob := &tuner{worker: floor, floor: floor, ceiling: floor * 4}
+	knob := &governor{worker: floor, floor: floor, ceiling: floor * 4}
 	capacity := int(atomic.LoadInt32(&knob.ceiling))
-	jobs := make(chan Site, capacity)
-	results := make(chan completed, capacity)
+	jobs := make(chan BlogSite, capacity)
+	results := make(chan finished, capacity)
 	inflight := map[string]bool{}
 	var guard sync.Mutex
 
@@ -519,38 +517,48 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 		go func() {
 			defer pool.Done()
 			for site := range jobs {
-				siteCtx, cancel := context.WithTimeout(task, crawler.Timeout())
+				siteCtx, cancel := context.WithTimeout(task, scout.Timeout())
 				complete := site.Name != "" && site.Feed != "" && site.Language != ""
-				outcome := crawler.Crawl(siteCtx, &site, site.State != "alive" || !complete)
+				result := scout.inspect(siteCtx, &site, site.State != "alive" || !complete)
 				cancel()
-				results <- completed{site: site, outcome: outcome}
+				results <- finished{site: site, result: result}
 			}
 		}()
 	}
 
+	store := make(chan finished, capacity)
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for done := range store {
+			if len(done.result.Links) > 0 {
+				table.queueHosts(done.result.Links, time.Now().UTC())
+			}
+			if len(done.result.Friends) > 0 {
+				done.result.Friend = table.friendIndex(done.result.Friends)
+			}
+			table.persist(&done.site, done.result)
+			tail := done.result.Reason
+			if tail == "" {
+				tail = gathered(&done.site)
+			}
+			fmt.Printf("%s [%s] %s %s\n", time.Now().Format(time.RFC3339), done.site.State, done.site.Host, tail)
+		}
+	}()
+
 	tuneTicker := time.NewTicker(5 * time.Second)
 	defer tuneTicker.Stop()
 
-	var cycle BatchTally
+	var cycle Tally
 
-	handle := func(done completed) {
-		if len(done.outcome.Links) > 0 {
-			table.Enqueue(done.outcome.Links, time.Now().UTC())
-		}
-		if len(done.outcome.Friends) > 0 {
-			done.outcome.Friend = table.FriendOrdinals(done.outcome.Friends)
-		}
-		table.Save(&done.site, done.outcome)
+	handle := func(done finished) {
 		guard.Lock()
 		delete(inflight, done.site.Host)
-		cycle.Requests += done.outcome.Requests
-		cycle.Timeouts += done.outcome.Timeouts
+		cycle.Requests += done.result.Requests
+		cycle.Timeouts += done.result.Timeouts
 		guard.Unlock()
-		tail := done.outcome.Reason
-		if tail == "" {
-			tail = gathered(&done.site)
-		}
-		fmt.Printf("%s [%s] %s %s\n", time.Now().Format(time.RFC3339), done.site.State, done.site.Host, tail)
+		store <- done
 	}
 
 	wait := func(limit time.Duration) bool {
@@ -579,13 +587,13 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 		guard.Unlock()
 
 		if want := int(atomic.LoadInt32(&knob.worker)) - pending; want > 0 {
-			batch, failure := table.Dequeue(time.Now().UTC(), want, busy)
+			batch, failure := table.claimDue(time.Now().UTC(), want, busy)
 			if failure != nil {
 				fmt.Fprintf(os.Stderr, "取站失败：%v\n", failure)
 				break
 			}
 			if len(batch) == 0 {
-				running = wait(table.NextDue(time.Now().UTC()))
+				running = wait(table.nextWake(time.Now().UTC()))
 				continue
 			}
 			for _, site := range batch {
@@ -609,19 +617,7 @@ func crawlPipeline(task context.Context, table *BlogTable, crawler *Crawler) err
 	pool.Wait()
 	close(results)
 	<-drained
+	close(store)
+	writer.Wait()
 	return nil
-}
-
-func gathered(site *Site) string {
-	parts := make([]string, 0, 9)
-	for _, item := range [][2]string{
-		{"feed", site.Feed}, {"lang", site.Language}, {"name", site.Name},
-		{"author", site.Author}, {"icp", site.ICP}, {"summary", site.Summary},
-		{"tag", site.Tags}, {"friend", site.Friend}, {"framework", site.Framework},
-	} {
-		if item[1] != "" {
-			parts = append(parts, item[0]+"="+item[1])
-		}
-	}
-	return strings.Join(parts, " ")
 }
