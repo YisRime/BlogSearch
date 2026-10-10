@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
 )
+
+var htmlTag = regexp.MustCompile(`<[^>]*>`)
 
 func slots(count int) string {
 	return "(?" + strings.Repeat(",?", count-1) + ")"
@@ -22,6 +26,14 @@ func clip(text string, limit int) string {
 		return string([]rune(text)[:limit])
 	}
 	return text
+}
+
+func containsAny(text string, marks []string) bool {
+	return slices.ContainsFunc(marks, func(mark string) bool { return strings.Contains(text, mark) })
+}
+
+func plainText(text string) string {
+	return collapse(htmlTag.ReplaceAllString(html.UnescapeString(text), " "))
 }
 
 func pickFirst(values ...string) string {

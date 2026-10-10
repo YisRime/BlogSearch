@@ -65,7 +65,10 @@ func seedHost(raw string) string {
 		return ""
 	}
 	registrable := registrableOf(host)
-	if registrable == "" || (host != registrable && host != "blog."+registrable) {
+	if registrable == "" {
+		return host
+	}
+	if host != registrable && host != "blog."+registrable {
 		return ""
 	}
 	if hubHosts[registrable] {

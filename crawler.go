@@ -20,9 +20,23 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/html/charset"
 )
+
+var feedPaths = []string{
+	"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/feed/", "/rss.xml",
+	"/rss", "/rss/", "/atom", "/index.atom", "/index.rss",
+	"/blog/feed", "/blog/atom.xml", "/blog/index.xml", "/posts/index.xml",
+	"/feeds/posts/default",
+}
+
+var friendPaths = []string{"/links", "/friends", "/link", "/blogroll", "/friend", "/links/", "/link.html"}
+
+var sitemapPaths = []string{"/sitemap.xml", "/sitemap_index.xml"}
+
+var logFields = []string{"feed", "lang", "name", "author", "icp", "summary", "tag", "friend", "framework"}
 
 type Reply struct {
 	Status   int
@@ -70,6 +84,18 @@ type Scout struct {
 type hostSet struct {
 	seen  map[string]bool
 	items []string
+}
+
+type governor struct {
+	guard   sync.Mutex
+	worker  int32
+	floor   int32
+	ceiling int32
+}
+
+type finished struct {
+	site   BlogSite
+	result Result
 }
 
 func dialer(relaxed bool, maxConns, perHost int) *http.Transport {
@@ -126,6 +152,9 @@ func (scout *Scout) remember(key, target string) {
 }
 
 func decodeBody(body []byte, contentType string) []byte {
+	if utf8.Valid(body) {
+		return body
+	}
 	reader, failure := charset.NewReader(bytes.NewReader(body), contentType)
 	if failure != nil {
 		return body
@@ -152,6 +181,7 @@ func (scout *Scout) fetch(task context.Context, target string, follow, relaxed b
 		return nil, failure
 	}
 	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	response, failure := client.Do(request)
 	if failure != nil {
 		return nil, failure
@@ -203,7 +233,8 @@ func (scout *Scout) tryEither(task context.Context, result *Result, target strin
 	}
 	refused := errors.Is(failure, syscall.ECONNREFUSED)
 	closed := errors.Is(failure, io.EOF) || errors.Is(failure, io.ErrUnexpectedEOF)
-	if fallback == "" || (!refused && !closed) {
+	broken := strings.Contains(failure.Error(), "tls:")
+	if fallback == "" || (!refused && !closed && !broken) {
 		return nil, target, failure
 	}
 	reply, failure = scout.tryPage(task, result, fallback, follow, false)
@@ -263,43 +294,51 @@ func (set *hostSet) keep(raw string) string {
 	return hostname
 }
 
-func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, registrable string, hosts *hostSet) (Home, bool) {
-	dead := func(failure error) {
-		record := &net.DNSError{}
-		rejected := errors.As(failure, &record) && !record.IsTemporary &&
-			(record.IsNotFound || strings.Contains(record.Err, "no data"))
-		if rejected {
-			result.State, result.Reason = "dead", "地址无效"
-			return
-		}
-		mark(result, "pend", "抓取失败", failure.Error())
-	}
+func dnsMissing(failure error) bool {
+	record := &net.DNSError{}
+	return errors.As(failure, &record) && !record.IsTemporary &&
+		(record.IsNotFound || strings.Contains(record.Err, "no data"))
+}
+
+func resolveHost(task context.Context, site *BlogSite, result *Result) bool {
 	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
 	if failure != nil {
-		dead(failure)
-		return Home{}, false
+		if dnsMissing(failure) {
+			result.State, result.Reason = "dead", "地址无效"
+		} else {
+			mark(result, "pend", "抓取失败", failure.Error())
+		}
+		return false
 	}
 	if len(addresses) == 0 {
 		mark(result, "dead", "地址无效", "")
-		return Home{}, false
+		return false
 	}
+	return true
+}
+
+func (scout *Scout) walkHops(task context.Context, site *BlogSite, result *Result, registrable string, hosts *hostSet) (*Reply, string, bool) {
 	target := "https://" + site.Host + "/"
 	tried := map[string]bool{target: true}
 	var reply *Reply
+	var failure error
 	for hop := 0; hop <= 3; hop++ {
 		wanted := target
-		var hopFailure error
-		reply, target, hopFailure = scout.tryEither(task, result, target, false)
+		reply, target, failure = scout.tryEither(task, result, target, false)
 		tried[wanted], tried[target] = true, true
-		if hopFailure != nil {
-			dead(hopFailure)
-			return Home{}, false
+		if failure != nil {
+			if dnsMissing(failure) {
+				result.State, result.Reason = "dead", "地址无效"
+			} else {
+				mark(result, "pend", "抓取失败", failure.Error())
+			}
+			return nil, "", false
 		}
 		if !reply.CertEnd.IsZero() {
 			result.CertEnd = reply.CertEnd
 		}
 		if reply.Status < 300 || reply.Status >= 400 {
-			break
+			return reply, target, true
 		}
 		next := reply.Location
 		if location, failure := url.Parse(next); failure == nil && !location.IsAbs() {
@@ -310,22 +349,32 @@ func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, r
 		hostname := normalizeHost(next)
 		if hostname == "" {
 			mark(result, "pend", "地址无效", "")
-			return Home{}, false
+			return nil, "", false
 		}
 		if tried[next] {
 			mark(result, "pend", "跳转过多", "")
-			return Home{}, false
+			return nil, "", false
 		}
 		hosts.keep(hostname)
 		if registrableOf(hostname) != registrable {
 			result.State, result.Links = "dead", hosts.items
-			return Home{}, false
+			return nil, "", false
 		}
-		if hop < 3 {
-			target = next
-			continue
+		if hop == 3 {
+			mark(result, "pend", "跳转过多", "")
+			return nil, "", false
 		}
-		mark(result, "pend", "跳转过多", "")
+		target = next
+	}
+	return nil, "", false
+}
+
+func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, registrable string, hosts *hostSet) (Home, bool) {
+	if !resolveHost(task, site, result) {
+		return Home{}, false
+	}
+	reply, target, ok := scout.walkHops(task, site, result, registrable, hosts)
+	if !ok {
 		return Home{}, false
 	}
 	if reply.Status >= 400 {
@@ -349,39 +398,12 @@ func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, r
 	return page, true
 }
 
-func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, result *Result, registrable string, hosts *hostSet) {
-	if hubHosts[registrable] {
-		return
-	}
-	guesses := []string{"/links", "/friends", "/link", "/blogroll", "/friend", "/links/", "/link.html"}
-	friends := make([]string, 0, len(page.Friends)+len(guesses))
-	friends = append(friends, page.Friends...)
-	friends = append(friends, siteURLs(site.Host, guesses)...)
-	if reply, target, _ := scout.pick(task, result, friends, nil); reply != nil {
-		for _, link := range readPage(reply.Body, target).Links {
-			neighbor := registrableOf(link)
-			if neighbor == registrable || hubHosts[neighbor] {
-				continue
-			}
-			if host := hosts.keep(link); host != "" {
-				result.Friends = append(result.Friends, host)
-			}
-		}
-	}
-}
-
 func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, result *Result) {
 	key := page.Framework
 	if key == "" {
 		key = "default"
 	}
-	guesses := []string{
-		"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/feed/", "/rss.xml",
-		"/rss", "/rss/", "/atom", "/index.atom", "/index.rss",
-		"/blog/feed", "/blog/atom.xml", "/blog/index.xml", "/posts/index.xml",
-		"/feeds/posts/default",
-	}
-	candidates := make([]string, 0, len(guesses)+3)
+	candidates := make([]string, 0, len(feedPaths)+3)
 	if site.Feed != "" {
 		candidates = append(candidates, site.Feed)
 	}
@@ -392,7 +414,7 @@ func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, r
 		if page.Feed != "" {
 			candidates = append(candidates, page.Feed)
 		}
-		candidates = append(candidates, siteURLs(site.Host, guesses)...)
+		candidates = append(candidates, siteURLs(site.Host, feedPaths)...)
 	}
 	var subscription Feed
 	reply, target, reason := scout.pick(task, result, candidates, func(reply *Reply, _ string) bool {
@@ -411,10 +433,51 @@ func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, r
 		if subscription.Language != "" {
 			result.Language = subscription.Language
 		}
+		if result.Summary == "" && subscription.Summary != "" {
+			result.Summary = subscription.Summary
+		}
 		return
 	}
 	if reason != "" {
 		mark(result, "alive", "订阅失败", reason)
+	}
+}
+
+func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *Result, hosts *hostSet) {
+	candidates := siteURLs(site.Host, sitemapPaths)
+	if recalled := scout.lookup("sitemap"); recalled != "" {
+		candidates = append([]string{"https://" + site.Host + recalled}, candidates...)
+	}
+	reply, target, _ := scout.pick(task, result, candidates, nil)
+	if reply == nil {
+		return
+	}
+	for _, link := range ParseSitemap(reply.Body) {
+		if hubHosts[registrableOf(link)] {
+			continue
+		}
+		hosts.keep(link)
+	}
+	scout.remember("sitemap", target)
+}
+
+func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, result *Result, registrable string, hosts *hostSet) {
+	if hubHosts[registrable] {
+		return
+	}
+	friends := make([]string, 0, len(page.Friends)+len(friendPaths))
+	friends = append(friends, page.Friends...)
+	friends = append(friends, siteURLs(site.Host, friendPaths)...)
+	if reply, target, _ := scout.pick(task, result, friends, nil); reply != nil {
+		for _, link := range readPage(reply.Body, target).Links {
+			neighbor := registrableOf(link)
+			if neighbor == registrable || hubHosts[neighbor] {
+				continue
+			}
+			if host := hosts.keep(link); host != "" {
+				result.Friends = append(result.Friends, host)
+			}
+		}
 	}
 }
 
@@ -426,21 +489,11 @@ func (scout *Scout) inspect(task context.Context, site *BlogSite, full bool) Res
 	if !reached {
 		return result
 	}
-	if full {
+	if full || (result.Summary == "" && (site.Feed != "" || page.Feed != "")) {
 		scout.subscribe(task, site, page, &result)
-		candidates := siteURLs(site.Host, []string{"/sitemap.xml", "/sitemap_index.xml"})
-		if recalled := scout.lookup("sitemap"); recalled != "" {
-			candidates = append([]string{"https://" + site.Host + recalled}, candidates...)
-		}
-		if reply, target, _ := scout.pick(task, &result, candidates, nil); reply != nil {
-			for _, link := range ParseSitemap(reply.Body) {
-				if hubHosts[registrableOf(link)] {
-					continue
-				}
-				hosts.keep(link)
-			}
-			scout.remember("sitemap", target)
-		}
+	}
+	if full {
+		scout.probeSitemap(task, site, &result, hosts)
 	}
 	if full || site.Friend == "" {
 		scout.expand(task, site, page, &result, registrable, hosts)
@@ -450,18 +503,6 @@ func (scout *Scout) inspect(task context.Context, site *BlogSite, full bool) Res
 		result.State, result.Reason = "other", "非博客"
 	}
 	return result
-}
-
-type governor struct {
-	guard   sync.Mutex
-	worker  int32
-	floor   int32
-	ceiling int32
-}
-
-type finished struct {
-	site   BlogSite
-	result Result
 }
 
 func (knob *governor) tune(count Tally) {
@@ -489,14 +530,12 @@ func takeWindow(tally *Tally, guard *sync.Mutex) Tally {
 }
 
 func gathered(site *BlogSite) string {
-	parts := make([]string, 0, 9)
-	for _, item := range [][2]string{
-		{"feed", site.Feed}, {"lang", site.Language}, {"name", site.Name},
-		{"author", site.Author}, {"icp", site.ICP}, {"summary", site.Summary},
-		{"tag", site.Tags}, {"friend", site.Friend}, {"framework", site.Framework},
-	} {
-		if item[1] != "" {
-			parts = append(parts, item[0]+"="+item[1])
+	values := [9]string{site.Feed, site.Language, site.Name, site.Author, site.ICP,
+		site.Summary, site.Tags, site.Friend, site.Framework}
+	parts := make([]string, 0, len(values))
+	for index, value := range values {
+		if value != "" {
+			parts = append(parts, logFields[index]+"="+value)
 		}
 	}
 	return strings.Join(parts, " ")
