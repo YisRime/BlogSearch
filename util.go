@@ -13,14 +13,17 @@ import (
 
 var htmlTag = regexp.MustCompile(`<[^>]*>`)
 
+// 拼占位符
 func slots(count int) string {
 	return "(?" + strings.Repeat(",?", count-1) + ")"
 }
 
+// 折叠空白
 func collapse(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
 
+// 截断文本
 func clip(text string, limit int) string {
 	if utf8.RuneCountInString(text) > limit {
 		return string([]rune(text)[:limit])
@@ -28,14 +31,17 @@ func clip(text string, limit int) string {
 	return text
 }
 
+// 判命中任一
 func containsAny(text string, marks []string) bool {
 	return slices.ContainsFunc(marks, func(mark string) bool { return strings.Contains(text, mark) })
 }
 
+// 取纯文本
 func plainText(text string) string {
 	return collapse(htmlTag.ReplaceAllString(html.UnescapeString(text), " "))
 }
 
+// 取首个非空
 func pickFirst(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -45,6 +51,7 @@ func pickFirst(values ...string) string {
 	return ""
 }
 
+// 取属性
 func attrOf(node *html.Node, key string) string {
 	for _, attr := range node.Attr {
 		if strings.EqualFold(attr.Key, key) {
@@ -54,6 +61,7 @@ func attrOf(node *html.Node, key string) string {
 	return ""
 }
 
+// 取直系文本
 func textOf(node *html.Node) string {
 	var buffer bytes.Buffer
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
@@ -65,6 +73,7 @@ func textOf(node *html.Node) string {
 	return collapse(buffer.String())
 }
 
+// 解析链接
 func resolveLink(link string, root *url.URL) *url.URL {
 	if root == nil {
 		return nil

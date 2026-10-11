@@ -8,6 +8,7 @@ import (
 	"syscall"
 )
 
+// 启动程序
 func main() {
 	table, failure := openTable("data/blogsearch.db")
 	abort(failure)
@@ -21,6 +22,7 @@ func main() {
 	abort(runCrawl(task, table, newScout()))
 }
 
+// 退出程序
 func abort(failure error) {
 	if failure != nil {
 		fmt.Fprintln(os.Stderr, failure)

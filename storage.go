@@ -16,6 +16,7 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// 站点行
 type BlogSite struct {
 	Host      string
 	Feed      string
@@ -33,11 +34,13 @@ type BlogSite struct {
 	CheckAt   string
 }
 
+// 数据表
 type BlogTable struct {
 	database *sql.DB
 	write    *sql.Stmt
 }
 
+// 打开数据库
 func openTable(path string) (*BlogTable, error) {
 	if directory := filepath.Dir(path); directory != "" && directory != "." {
 		if failure := os.MkdirAll(directory, 0o755); failure != nil {
@@ -68,6 +71,7 @@ func openTable(path string) (*BlogTable, error) {
 	return &BlogTable{database: connection, write: upsert}, nil
 }
 
+// 入队主机
 func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	stamp := now.Format(time.RFC3339)
 	valid := make([]string, 0, len(hosts))
@@ -90,6 +94,7 @@ func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	}
 }
 
+// 领取到期
 func (table *BlogTable) claimDue(now time.Time, batch int, busy []string) ([]BlogSite, error) {
 	query := `SELECT host,feed,lang,name,author,icp,summary,tag,friend,framework,state,retry,cert,check_at FROM blog
 		WHERE check_at<>'' AND check_at<=?`
@@ -119,6 +124,7 @@ func (table *BlogTable) claimDue(now time.Time, batch int, busy []string) ([]Blo
 	return sites, rows.Err()
 }
 
+// 算下次唤醒
 func (table *BlogTable) nextWake(now time.Time) time.Duration {
 	var text sql.NullString
 	failure := table.database.QueryRow(`SELECT MIN(check_at) FROM blog WHERE check_at<>'' AND check_at>?`,
@@ -130,6 +136,7 @@ func (table *BlogTable) nextWake(now time.Time) time.Duration {
 	return min(max(time.Until(when), 5*time.Second), 5*time.Minute)
 }
 
+// 取友链 rowid
 func (table *BlogTable) friendIndex(hosts []string) string {
 	seen := map[string]bool{}
 	keys := make([]string, 0, len(hosts))
@@ -178,21 +185,24 @@ func (table *BlogTable) friendIndex(hosts []string) string {
 	return string(text)
 }
 
+// 算重试间隔
+func retryDelay(attempt int) time.Duration {
+	return min(time.Duration(attempt)*24*time.Hour, 7*24*time.Hour)
+}
+
+// 写回数据库
 func (table *BlogTable) persist(site *BlogSite, result Result) {
 	now := time.Now().UTC()
 	schedule := func(delay time.Duration) { site.CheckAt = now.Add(delay).Format(time.RFC3339) }
 	switch result.State {
 	case "alive":
 		site.State, site.Retry = "alive", 0
-		for _, pair := range [][2]*string{
-			{&site.Name, &result.Name}, {&site.Author, &result.Author}, {&site.Feed, &result.Feed},
-			{&site.Language, &result.Language}, {&site.Framework, &result.Framework},
-			{&site.ICP, &result.ICP}, {&site.Summary, &result.Summary}, {&site.Friend, &result.Friend},
-		} {
-			if *pair[1] != "" {
-				*pair[0] = *pair[1]
-			}
-		}
+		site.Name = pickFirst(result.Name, site.Name)
+		site.Author, site.Language = result.Author, result.Language
+		site.Framework, site.ICP = result.Framework, result.ICP
+		site.Summary = result.Summary
+		site.Feed = pickFirst(result.Feed, site.Feed)
+		site.Friend = pickFirst(result.Friend, site.Friend)
 		delay := 30 * 24 * time.Hour
 		if margin := result.CertEnd.Sub(now) - 3*24*time.Hour; !result.CertEnd.IsZero() && margin > 0 && margin < delay {
 			delay = margin
@@ -201,11 +211,11 @@ func (table *BlogTable) persist(site *BlogSite, result Result) {
 	case "other", "dead":
 		site.State, site.CheckAt, site.Retry = result.State, "", 0
 	default:
-		site.Retry++
+		site.State, site.Retry = "pend", site.Retry+1
 		if site.Retry >= 3 {
 			site.State, site.CheckAt = "fail", ""
 		} else {
-			schedule(24 * time.Hour)
+			schedule(retryDelay(site.Retry))
 		}
 	}
 	site.Cert = site.Cert || result.Cert

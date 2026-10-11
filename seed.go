@@ -13,6 +13,7 @@ import (
 	"time"
 )
 
+// 种子条目
 type seedEntry struct {
 	URL  string   `json:"url"`
 	Name string   `json:"name"`
@@ -20,6 +21,7 @@ type seedEntry struct {
 	Tags []string `json:"tags"`
 }
 
+// 种子候选
 type seedCandidate struct {
 	host string
 	name string
@@ -27,6 +29,7 @@ type seedCandidate struct {
 	tags string
 }
 
+// 下载种子
 func downloadSeed(target string) ([]byte, error) {
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -55,6 +58,7 @@ func downloadSeed(target string) ([]byte, error) {
 	return nil, last
 }
 
+// 清洗种子主机
 func seedHost(raw string) string {
 	host := normalizeHost(raw)
 	if host == "" {
@@ -77,6 +81,7 @@ func seedHost(raw string) string {
 	return host
 }
 
+// 探测首页
 func (scout *Scout) probeHome(task context.Context, host string) bool {
 	origin := "https://" + host + "/"
 	reply, target, failure := scout.tryEither(task, &Result{}, origin, true)
@@ -91,7 +96,7 @@ func (scout *Scout) probeHome(task context.Context, host string) bool {
 	}
 	if reply.Status == http.StatusOK {
 		page := readPage(reply.Body, target)
-		return !errorPage(page.Name) && (page.Name != "" || page.Feed != "" || len(page.Links) != 0)
+		return !errorPage(page.Name) && (page.Name != "" || page.Feed != "" || page.HasLinks)
 	}
 	switch reply.Status {
 	case 402, 404, 410, 444, 451, 456, 530:
@@ -100,6 +105,7 @@ func (scout *Scout) probeHome(task context.Context, host string) bool {
 	return true
 }
 
+// 探测单种子
 func (scout *Scout) probeSeed(task context.Context, candidate seedCandidate) bool {
 	if scout.probeHome(task, candidate.host) {
 		return true
@@ -115,6 +121,7 @@ func (scout *Scout) probeSeed(task context.Context, candidate seedCandidate) boo
 	return failure == nil && reply.Status == http.StatusOK && ParseSubscription(reply.Body).Parsed
 }
 
+// 并发探种子
 func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) []seedCandidate {
 	alive := make([]bool, len(candidates))
 	queue := make(chan int)
@@ -146,6 +153,7 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 	return kept
 }
 
+// 导入种子
 func SeedBlogs(table *BlogTable) error {
 	body, failure := downloadSeed("https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json")
 	if failure != nil {
