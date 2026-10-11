@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +12,7 @@ import (
 	"time"
 )
 
-// 种子条目
+// 博客种子条目
 type seedEntry struct {
 	URL  string   `json:"url"`
 	Name string   `json:"name"`
@@ -21,7 +20,7 @@ type seedEntry struct {
 	Tags []string `json:"tags"`
 }
 
-// 种子候选
+// 待测种子候选
 type seedCandidate struct {
 	host string
 	name string
@@ -29,7 +28,7 @@ type seedCandidate struct {
 	tags string
 }
 
-// 并发探种子
+// 并发检测种子
 func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) []seedCandidate {
 	judge := func(reply *Reply, target string) bool {
 		if reply.Status == http.StatusOK {
@@ -50,8 +49,7 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 		case failure == nil:
 			alive = judge(reply, target)
 		default:
-			var timeout interface{ Timeout() bool }
-			if errors.Is(failure, context.DeadlineExceeded) || (errors.As(failure, &timeout) && timeout.Timeout()) {
+			if isTimeout(failure) {
 				alive = true
 			} else if reply, target, failure = scout.tryEither(task, &Result{}, origin, true); failure == nil {
 				alive = judge(reply, target)
@@ -97,7 +95,7 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 	return kept
 }
 
-// 导入种子
+// 导入博客种子
 func SeedBlogs(table *BlogTable) error {
 	target := "https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json"
 	var body []byte

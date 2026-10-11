@@ -16,7 +16,7 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
-// 站点行
+// 站点数据行
 type BlogSite struct {
 	Host      string
 	Feed      string
@@ -34,13 +34,13 @@ type BlogSite struct {
 	CheckAt   string
 }
 
-// 数据表
+// 站点数据库
 type BlogTable struct {
 	database *sql.DB
 	write    *sql.Stmt
 }
 
-// 打开数据库
+// 打开数据连接
 func openTable(path string) (*BlogTable, error) {
 	if directory := filepath.Dir(path); directory != "" && directory != "." {
 		if failure := os.MkdirAll(directory, 0o755); failure != nil {
@@ -71,7 +71,7 @@ func openTable(path string) (*BlogTable, error) {
 	return &BlogTable{database: connection, write: upsert}, nil
 }
 
-// 入队主机
+// 加入待测主机
 func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	stamp := now.Format(time.RFC3339)
 	valid := make([]string, 0, len(hosts))
@@ -96,7 +96,7 @@ func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	}
 }
 
-// 领取到期
+// 提取到期记录
 func (table *BlogTable) claimDue(now time.Time, batch int, busy []string) ([]BlogSite, error) {
 	query := `SELECT host,feed,lang,name,author,icp,summary,tag,friend,framework,state,retry,cert,check_at FROM blog
 		WHERE check_at<>'' AND check_at<=?`
@@ -126,7 +126,7 @@ func (table *BlogTable) claimDue(now time.Time, batch int, busy []string) ([]Blo
 	return sites, rows.Err()
 }
 
-// 算下次唤醒
+// 计算唤醒时间
 func (table *BlogTable) nextWake(now time.Time) time.Duration {
 	var text sql.NullString
 	failure := table.database.QueryRow(`SELECT MIN(check_at) FROM blog WHERE check_at<>'' AND check_at>?`,
@@ -138,7 +138,7 @@ func (table *BlogTable) nextWake(now time.Time) time.Duration {
 	return min(max(time.Until(when), 5*time.Second), 5*time.Minute)
 }
 
-// 取友链 rowid
+// 读取友链编号
 func (table *BlogTable) friendIndex(hosts []string) string {
 	seen := map[string]bool{}
 	keys := make([]string, 0, len(hosts))
@@ -187,7 +187,7 @@ func (table *BlogTable) friendIndex(hosts []string) string {
 	return string(text)
 }
 
-// 写回数据库
+// 保存数据库行
 func (table *BlogTable) persist(site *BlogSite, result Result) {
 	now := time.Now().UTC()
 	schedule := func(delay time.Duration) { site.CheckAt = now.Add(delay).Format(time.RFC3339) }

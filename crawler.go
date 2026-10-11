@@ -28,24 +28,22 @@ import (
 	"golang.org/x/net/html/charset"
 )
 
-// 订阅源探测路径
+// 订阅探测路径
 var feedPaths = []string{
 	"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/feed/", "/rss.xml",
 	"/rss", "/rss/", "/atom", "/index.atom", "/index.rss", "/blog/feed",
 }
 
-// 友链页探测路径
+// 友链探测路径
 var friendPaths = []string{
 	"/links", "/friends", "/link", "/friend", "/blogroll",
 	"/links/", "/friends/", "/links.html", "/friends.html", "/friendlinks",
 }
 
+// 站点地图标记
 var sitemapPaths = []string{"/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/index.xml"}
 
-// 浏览器 UA
-const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-// 盾特征表
+// 拦截特征表
 var shieldMarks = [][2]string{
 	{"just a moment", "挑战"}, {"cf-challenge", "挑战"}, {"challenge-platform", "挑战"},
 	{"_cf_chl_", "挑战"}, {"cf_chl_opt", "挑战"}, {"checking your browser", "挑战"},
@@ -53,13 +51,7 @@ var shieldMarks = [][2]string{
 	{"attention required", "拦截"}, {"ddos protection by", "拦截"}, {"under attack mode", "拦截"},
 }
 
-// meta 跳转
-var refreshPattern = regexp.MustCompile(`(?is)<meta[^>]+content\s*=\s*["']?\s*\d+\s*;\s*url\s*=\s*([^"'>\s]+)`)
-
-// JS 跳转
-var jsRedirectPattern = regexp.MustCompile(`(?is)location\s*\.\s*(?:href\s*=\s*|replace\s*\(\s*|assign\s*\(\s*)["']([^"']+)["']`)
-
-// 取绝对地址
+// 解析绝对地址
 func absoluteURL(raw, base string) string {
 	raw = strings.Trim(strings.TrimSpace(raw), `"'`)
 	if raw == "" {
@@ -82,7 +74,7 @@ func absoluteURL(raw, base string) string {
 	return parsed.String()
 }
 
-// 应答
+// 请求响应信息
 type Reply struct {
 	Status    int
 	Body      []byte
@@ -94,7 +86,7 @@ type Reply struct {
 	Refresh   string
 }
 
-// 抓取结果
+// 爬取结果数据
 type Result struct {
 	State     string
 	Reason    string
@@ -114,13 +106,13 @@ type Result struct {
 	Summary   string
 }
 
-// 统计
+// 运行统计项
 type Tally struct {
 	Requests int
 	Timeouts int
 }
 
-// 抓取器
+// 并发爬取器
 type Scout struct {
 	client      *http.Client
 	follower    *http.Client
@@ -132,13 +124,13 @@ type Scout struct {
 	learned map[string]string
 }
 
-// 主机去重集
+// 主机去重集合
 type hostSet struct {
 	seen  map[string]bool
 	items []string
 }
 
-// 并发调节
+// 调整并发数量
 type governor struct {
 	guard   sync.Mutex
 	worker  int32
@@ -146,13 +138,13 @@ type governor struct {
 	ceiling int32
 }
 
-// 完成项
+// 完成任务项
 type finished struct {
 	site   BlogSite
 	result Result
 }
 
-// 构造传输层
+// 构造传输配置
 func dialer(relaxed bool, maxConns, perHost int) *http.Transport {
 	return &http.Transport{
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -165,7 +157,7 @@ func dialer(relaxed bool, maxConns, perHost int) *http.Transport {
 	}
 }
 
-// 构造抓取器
+// 创建爬取器
 func newScout() *Scout {
 	floor := runtime.GOMAXPROCS(0)
 	ceiling := floor * 4
@@ -185,7 +177,7 @@ func newScout() *Scout {
 	}
 }
 
-// 取超时值
+// 获取超时期限
 func (scout *Scout) Timeout() time.Duration {
 	scout.guard.Lock()
 	latency := scout.latency
@@ -193,14 +185,14 @@ func (scout *Scout) Timeout() time.Duration {
 	return min(max(time.Duration(4*latency*float64(time.Second)), 10*time.Second), 60*time.Second)
 }
 
-// 读学习缓存
+// 读取学习缓存
 func (scout *Scout) lookup(key string) string {
 	scout.guard.Lock()
 	defer scout.guard.Unlock()
 	return scout.learned[key]
 }
 
-// 写学习缓存
+// 写入学习缓存
 func (scout *Scout) remember(key, target string) {
 	parsed, failure := url.Parse(target)
 	if failure != nil || parsed.Path == "" {
@@ -211,7 +203,7 @@ func (scout *Scout) remember(key, target string) {
 	scout.guard.Unlock()
 }
 
-// 发单次请求
+// 发送单次请求
 func (scout *Scout) fetch(task context.Context, target string, follow, relaxed bool) (*Reply, error) {
 	client := scout.client
 	switch {
@@ -227,7 +219,7 @@ func (scout *Scout) fetch(task context.Context, target string, follow, relaxed b
 		return nil, failure
 	}
 	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	request.Header.Set("User-Agent", browserUA)
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	request.Header.Set("Cache-Control", "no-cache")
 	request.Header.Set("Upgrade-Insecure-Requests", "1")
 	request.Header.Set("Sec-Fetch-Dest", "document")
@@ -262,7 +254,7 @@ func (scout *Scout) fetch(task context.Context, target string, follow, relaxed b
 	return reply, nil
 }
 
-// 请求单页
+// 请求页面内容
 func (scout *Scout) tryPage(task context.Context, result *Result, target string, follow, relaxed bool) (*Reply, error) {
 	started := time.Now()
 	reply, failure := scout.fetch(task, target, follow, relaxed)
@@ -274,14 +266,13 @@ func (scout *Scout) tryPage(task context.Context, result *Result, target string,
 		scout.guard.Unlock()
 		return reply, nil
 	}
-	var timeout interface{ Timeout() bool }
-	if errors.Is(failure, context.DeadlineExceeded) || (errors.As(failure, &timeout) && timeout.Timeout()) {
+	if isTimeout(failure) {
 		result.Timeouts++
 	}
 	return reply, failure
 }
 
-// 先直连再回退
+// 直连失败回退
 func (scout *Scout) tryEither(task context.Context, result *Result, target string, follow bool) (*Reply, string, error) {
 	reply, failure := scout.tryPage(task, result, target, follow, false)
 	if failure == nil {
@@ -308,7 +299,7 @@ func (scout *Scout) tryEither(task context.Context, result *Result, target strin
 	return reply, fallback, failure
 }
 
-// 跟随跳转
+// 追踪网页跳转
 func (scout *Scout) hop(task context.Context, result *Result, start string, deep bool, guard func(string) bool) (*Reply, string, error) {
 	target := start
 	tried := map[string]bool{start: true}
@@ -323,7 +314,7 @@ func (scout *Scout) hop(task context.Context, result *Result, start string, deep
 		}
 		next := ""
 		switch {
-		case reply.Status >= 300 && reply.Status < 400:
+		case redirectStatus(reply.Status):
 			next = absoluteURL(reply.Location, final)
 		case deep:
 			raw := ""
@@ -334,9 +325,11 @@ func (scout *Scout) hop(task context.Context, result *Result, start string, deep
 				raw = reply.Refresh[index+4:]
 			case len(reply.Body) < 4096:
 				fromBody = true
-				if match := refreshPattern.FindSubmatch(reply.Body); match != nil {
+				// 页面跳转信息
+				if match := regexp.MustCompile(`(?is)<meta[^>]+content\s*=\s*["']?\s*\d+\s*;\s*url\s*=\s*([^"'>\s]+)`).FindSubmatch(reply.Body); match != nil {
 					raw = string(match[1])
-				} else if match := jsRedirectPattern.FindSubmatch(reply.Body); match != nil {
+					// 脚本跳转信息
+				} else if match := regexp.MustCompile(`(?is)location\s*\.\s*(?:href\s*=\s*|replace\s*\(\s*|assign\s*\(\s*)["']([^"']+)["']`).FindSubmatch(reply.Body); match != nil {
 					raw = string(match[1])
 				}
 			}
@@ -356,7 +349,7 @@ func (scout *Scout) hop(task context.Context, result *Result, start string, deep
 	return nil, target, nil
 }
 
-// 取首个可用
+// 选取首个可用
 func (scout *Scout) pick(task context.Context, result *Result, candidates []string, accept func(*Reply, string) bool) (*Reply, string, string) {
 	reason := ""
 	for _, candidate := range candidates {
@@ -383,7 +376,7 @@ func (scout *Scout) pick(task context.Context, result *Result, candidates []stri
 	return nil, "", reason
 }
 
-// 记结果状态
+// 记录结果状态
 func mark(result *Result, state, reason, payload string) {
 	result.State = state
 	if payload == "" {
@@ -393,7 +386,7 @@ func mark(result *Result, state, reason, payload string) {
 	result.Reason = reason + "：" + payload
 }
 
-// 拼候选地址
+// 拼接候选地址
 func siteURLs(host string, guesses []string) []string {
 	addresses := make([]string, 0, len(guesses))
 	for _, guess := range guesses {
@@ -402,7 +395,7 @@ func siteURLs(host string, guesses []string) []string {
 	return addresses
 }
 
-// 收主机去重
+// 收集去重主机
 func (set *hostSet) keep(raw string) string {
 	hostname := normalizeHost(raw)
 	if hostname == "" || set.seen[hostname] {
@@ -413,7 +406,7 @@ func (set *hostSet) keep(raw string) string {
 	return hostname
 }
 
-// 判死或重试
+// 判断失效重试
 func deadOrRetry(result *Result, failure error) {
 	var record *net.DNSError
 	if errors.As(failure, &record) && !record.IsTemporary &&
@@ -424,7 +417,7 @@ func deadOrRetry(result *Result, failure error) {
 	mark(result, "pend", "抓取失败", failure.Error())
 }
 
-// 跟随跳转
+// 追踪网页跳转
 func (scout *Scout) walkHops(task context.Context, site *BlogSite, result *Result, registrable string, hosts *hostSet) (*Reply, string, bool) {
 	guard := func(next string) bool {
 		hostname := normalizeHost(next)
@@ -454,7 +447,7 @@ func (scout *Scout) walkHops(task context.Context, site *BlogSite, result *Resul
 	return reply, target, true
 }
 
-// 抓首页
+// 抓取首页内容
 func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, registrable string, hosts *hostSet) (Home, bool) {
 	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
 	if failure != nil {
@@ -496,7 +489,7 @@ func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, r
 		mark(result, "pend", "被盾拦截", kind)
 		return Home{}, false
 	}
-	if reply.Status >= 300 && reply.Status < 400 {
+	if redirectStatus(reply.Status) {
 		mark(result, "pend", "跳转过多", "")
 		return Home{}, false
 	}
@@ -517,7 +510,7 @@ func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, r
 	return page, true
 }
 
-// 抓订阅源
+// 抓取订阅源
 func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, result *Result) {
 	key := page.Framework
 	if key == "" {
@@ -566,7 +559,7 @@ func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, r
 	}
 }
 
-// 找友链页
+// 寻找友链页面
 func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *Result, hosts *hostSet) []string {
 	candidates := siteURLs(site.Host, sitemapPaths)
 	if recalled := scout.lookup("sitemap"); recalled != "" {
@@ -602,7 +595,7 @@ func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *R
 	return seeds
 }
 
-// 抓友链页
+// 抓取友链页面
 func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, result *Result, registrable string, hosts *hostSet, seeds []string) {
 	if inDomainSet(site.Host, hubHosts) {
 		return
@@ -650,7 +643,7 @@ func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, resu
 	}
 }
 
-// 采集友链主机
+// 收集友链主机
 func (scout *Scout) harvestFriends(result *Result, registrable string, hosts *hostSet, body []byte, target string) int {
 	added := 0
 	for _, friend := range readFriends(body, target) {
@@ -666,7 +659,7 @@ func (scout *Scout) harvestFriends(result *Result, registrable string, hosts *ho
 	return added
 }
 
-// 抓取单站
+// 检测单个站点
 func (scout *Scout) inspect(task context.Context, site *BlogSite, full bool) Result {
 	result := Result{State: "alive"}
 	if HostOf(site.Host) == "" || inDomainSet(site.Host, hubHosts) || blockedHost(site.Host) {
@@ -696,7 +689,7 @@ func (scout *Scout) inspect(task context.Context, site *BlogSite, full bool) Res
 	return result
 }
 
-// 调整并发
+// 调整并发数量
 func (knob *governor) tune(count Tally) {
 	if count.Requests == 0 {
 		return
@@ -713,7 +706,7 @@ func (knob *governor) tune(count Tally) {
 	atomic.StoreInt32(&knob.worker, int32(min(max(worker, int(knob.floor)), int(knob.ceiling))))
 }
 
-// 跑抓取主循环
+// 执行抓取循环
 func runCrawl(task context.Context, table *BlogTable, scout *Scout) error {
 	floor := int32(runtime.GOMAXPROCS(0))
 	knob := &governor{worker: floor, floor: floor, ceiling: floor * 4}
