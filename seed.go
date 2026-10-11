@@ -33,7 +33,8 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 	judge := func(reply *Reply, target string) bool {
 		if reply.Status == http.StatusOK {
 			page := readPage(reply.Body, target)
-			return !errorPage(page.Name) && (page.Name != "" || page.Feed != "" || page.HasLinks)
+			return !errorPage(page.Name) &&
+				(page.Feed != "" || page.HasArchive || len(page.Friends) > 0)
 		}
 		switch reply.Status {
 		case 402, 404, 410, 444, 451, 456, 530:
@@ -97,12 +98,18 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 
 // 导入博客种子
 func SeedBlogs(table *BlogTable) error {
-	target := "https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json"
+	targets := []string{
+		"https://gcore.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json",
+		"https://fastly.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json",
+		"https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json",
+	}
 	var body []byte
 	var last error
-	for attempt := 0; attempt < 3 && body == nil; attempt++ {
-		time.Sleep(time.Duration(attempt) * 2 * time.Second)
-		request, failure := http.NewRequest(http.MethodGet, target, nil)
+	for attempt := 0; attempt < len(targets)*2 && body == nil; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+		request, failure := http.NewRequest(http.MethodGet, targets[attempt%len(targets)], nil)
 		if failure != nil {
 			return failure
 		}
@@ -142,7 +149,7 @@ func SeedBlogs(table *BlogTable) error {
 			continue
 		}
 		host = HostOf(host)
-		if host == "" || (registrable != "" && host != registrable && host != "blog."+registrable) {
+		if host == "" || blockedHost(host) || (registrable != "" && host != registrable && host != "blog."+registrable) {
 			continue
 		}
 		if seen[host] {

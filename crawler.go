@@ -424,11 +424,11 @@ func (scout *Scout) walkHops(task context.Context, site *BlogSite, result *Resul
 			mark(result, "dead", "其它跳转", "")
 			return true
 		}
-		hosts.keep(hostname)
 		if registrableOf(hostname) != registrable {
 			result.State, result.Links = "dead", hosts.items
 			return true
 		}
+		hosts.keep(hostname)
 		return false
 	}
 	reply, target, failure := scout.hop(task, result, "https://"+site.Host+"/", true, guard)
@@ -572,9 +572,10 @@ func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *R
 		return nil
 	}
 	var seeds []string
+	registrable := registrableOf(site.Host)
 	for _, entry := range append(document.URLs, document.Sitemaps...) {
 		link := entry.Loc
-		if link == "" || inDomainSet(normalizeHost(link), blockHosts) {
+		if link == "" || registrableOf(normalizeHost(link)) != registrable {
 			continue
 		}
 		hosts.keep(link)
@@ -589,6 +590,10 @@ func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *R
 // 抓取友链页面
 func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, result *Result, registrable string, hosts *hostSet, seeds []string) {
 	if inDomainSet(site.Host, blockHosts) {
+		return
+	}
+	// 博客信号判定
+	if result.Feed == "" && site.Feed == "" && result.Framework == "" && !page.HasArchive {
 		return
 	}
 	key := page.Framework
@@ -625,6 +630,9 @@ func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, resu
 func (scout *Scout) harvestFriends(result *Result, registrable string, hosts *hostSet, body []byte, target string) int {
 	added := 0
 	for _, friend := range readFriends(body, target) {
+		if added >= 60 {
+			break
+		}
 		host := normalizeHost(friend.URL)
 		if !friendWorthy(host, registrable) {
 			continue

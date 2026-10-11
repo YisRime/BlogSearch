@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
-	"fmt"
 	"net/netip"
 	"net/url"
 	"os"
@@ -24,13 +23,18 @@ var blockHosts = map[string]bool{}
 
 // 页面拦截词表
 var blockWords = []string{"页面不存在", "找不到页面", "页面未找到", "站点未找到", "网站未找到", "域名出售", "域名停放", "域名已过期",
-	"已到期", "请续费", "该域名正在出售", "建站中", "维护中", "敬请期待", "网址导航", "搜索引擎", "无法访问", "暂时无法", "买球", "赌球",
-	"棋牌", "娱乐城", "博彩", "下注", "彩票", "球盘", "让球", "体育投注", "开户", "万博", "免费观看", "在线观看", "影院", "招聘", "招贤",
-	"404", "not found", "access denied", "welcome to nginx", "index of", "default web site page",
-	"domain for sale", "this domain is for sale", "buy this domain", "domain expired",
-	"account suspended", "under construction", "coming soon", "will go into a meta tag",
-	"recent content on ", "slot", "careers", "career", "jobs", "job", "recruiting",
-	"recruitment", "talent", "apply", "hiring", "corporate", "search-careers", "searchjobs"}
+	"建站中", "买球", "赌球", "棋牌", "娱乐城", "博彩", "下注", "彩票", "体育投注", "免费观看", "招聘", "正在出售", "此域名", "域名专家",
+	"域名中介", "购彩", "球友会", "球盟会", "免费直播", "直播吧", "登录入口", "真人视讯", "电子游艺", "包赢", "404", "not found",
+	"access denied", "welcome to nginx", "index of", "default web site page", "domain for sale",
+	"this domain is for sale", "buy this domain", "domain expired", "account suspended",
+	"under construction", "will go into a meta tag", "recent content on ", "careers",
+	"career", "jobs", "recruiting", "recruitment", "hiring", "search-careers", "searchjobs",
+	"afternic", "sedo", "hugedomains", "expireddomains", "parked domain", "make an offer"}
+
+// 错误页面标记
+var errorMarks = []string{"导航", "大全", "合集", "收录", "有限公司", "责任公司", "集团", "商城", "银行", "证券", "保险",
+	"正品", "欢迎光临", "直播", "私服", "加速器", "press release", "news center", "corporation", "holdings",
+	"investor relations", "pharmaceutical", "insurance", "securities", "nasdaq", "nyse"}
 
 // 文本截断词表
 var cutWords = []string{"，", "。", "！", "？", "；", "：", "、", "…", "“",
@@ -43,18 +47,25 @@ var friendSkipMarks = []string{"nav", "menu", "footer", "header", "social",
 	"powered", "widget", "sidebar", "toolbar", "privacy", "policy", "agreement",
 	"cookie", "legal", "disclaimer", "terms", "third-party", "thirdparty"}
 
-// 强噪声标识
-var friendHardSkips = []string{"footer", "header", "navbar", "menu", "privacy",
-	"policy", "copyright", "breadcrumb", "pagination", "social", "share", "comment"}
-
-// 友链名称噪声
-var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "上一页", "下一页", "阅读全文",
-	"评论", "留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链", "home",
-	"more", "back", "next", "prev", "about", "archive", "tag", "category", "rss", "search"}
-
 // 友链识别标记
 var friendMarks = []string{"友链", "友情链接", "友邻", "朋友", "友情",
 	"friend", "blogroll", "link", "blogmate", "blogger"}
+
+// 友链名称噪声
+var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "上一页",
+	"下一页", "阅读全文", "评论", "留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链",
+	"工具", "平台", "官网", "导航", "资源", "下载", "文档", "社区", "论坛", "联系", "捐赠", "赞助", "广告", "统计", "站点",
+	"网站", "应用", "服务", "产品", "项目", "详情", "查看", "进入", "点击", "跳转", "访问", "home", "more", "back",
+	"next", "prev", "about", "archive", "tag", "category", "rss", "search", "link", "links",
+	"tool", "tools", "platform", "website", "resource", "resources", "download", "docs",
+	"documentation", "forum", "community", "contact", "sponsor", "donate", "stats", "visit"}
+
+// 通用标题词表
+var genericNames = map[string]bool{"首页": true, "主页": true, "网站首页": true,
+	"欢迎": true, "博客": true, "频道": true, "关于": true, "个人博客": true, "我的博客": true,
+	"网站主页": true, "home": true, "homepage": true, "blog": true, "index": true,
+	"untitled": true, "start": true, "welcome": true, "description": true, "posts": true,
+	"just a moment": true, "about": true, "about me": true, "main": true, "portal": true}
 
 // 作者名称噪声
 var authorNoise = map[string]bool{"互动": true, "评论": true, "登录": true, "注册": true, "分享": true,
@@ -65,26 +76,18 @@ var authorNoise = map[string]bool{"互动": true, "评论": true, "登录": true
 // 框架名称噪声
 var frameworkNoise = map[string]bool{"by": true, "with": true, "using": true,
 	"powered": true, "and": true, "the": true, "for": true, "on": true,
-	"in": true, "a": true, "an": true, "built": true, "version": true}
+	"in": true, "a": true, "an": true, "built": true, "version": true,
+	"all": true, "site": true, "kit": true, "wp": true, "seo": true,
+	"google": true, "microsoft": true, "clarity": true, "elementor": true,
+	"rocket": true, "pro": true, "cache": true, "plugin": true, "theme": true}
 
 // 框架识别特征
 var frameworkMarks = [][3]string{{"wordpress", "wp-content", "WordPress"},
 	{"typecho", "/usr/themes/", "Typecho"}, {"hexo", "hexo-theme", "Hexo"},
-	{"hugo", "", "Hugo"}, {"jekyll", "", "Jekyll"}, {"astro", "/_astro/", "Astro"},
-	{"next.js", "_next/", "Next.js"}, {"nuxt", "/_nuxt/", "Nuxt"}, {"gatsby", "___gatsby", "Gatsby"},
-	{"ghost", "/assets/built/", "Ghost"}, {"vuepress", "vuepress", "VuePress"},
-	{"vitepress", "vitepress", "VitePress"}, {"docusaurus", "docusaurus", "Docusaurus"},
-	{"gridea", "gridea", "Gridea"}, {"halo", "halo-theme", "Halo"}, {"zblog", "zblog", "Z-Blog"},
-	{"emlog", "emlog", "Emlog"}, {"docsify", "docsify", "Docsify"}, {"mkdocs", "mkdocs", "MkDocs"},
-	{"eleventy", "eleventy", "Eleventy"}, {"sveltekit", "__sveltekit", "SvelteKit"},
-	{"remix", "__remix", "Remix"}, {"pelican", "", "Pelican"}, {"zola", "", "Zola"}}
-
-// 通用标题词表
-var genericNames = map[string]bool{"首页": true, "主页": true, "网站首页": true,
-	"欢迎": true, "博客": true, "频道": true, "关于": true, "个人博客": true, "我的博客": true,
-	"网站主页": true, "home": true, "homepage": true, "blog": true, "index": true,
-	"untitled": true, "start": true, "welcome": true, "description": true, "posts": true,
-	"just a moment": true, "about": true, "about me": true, "main": true, "portal": true}
+	{"astro", "/_astro/", "Astro"}, {"next.js", "_next/", "Next.js"},
+	{"nuxt", "/_nuxt/", "Nuxt"}, {"gatsby", "___gatsby", "Gatsby"},
+	{"ghost", "/assets/built/", "Ghost"}, {"halo", "halo-theme", "Halo"},
+	{"sveltekit", "__sveltekit", "SvelteKit"}, {"remix", "__remix", "Remix"}}
 
 // 标签剥离正则
 var htmlTag = regexp.MustCompile(`<[^>]*>`)
@@ -325,7 +328,8 @@ func HostOf(host string) string {
 
 // 识别错误页面
 func errorPage(name string) bool {
-	return blockedText(collapse(name))
+	word := strings.ToLower(collapse(name))
+	return blockedText(word) || containsAny(word, errorMarks)
 }
 
 // 判断站点性质
@@ -510,18 +514,20 @@ func detectFramework(stated string, body []byte) string {
 	for len(kept) > 0 && frameworkNoise[strings.ToLower(kept[len(kept)-1])] {
 		kept = kept[:len(kept)-1]
 	}
-	if len(kept) > 0 {
+	if len(kept) > 0 && !frameworkNoise[strings.ToLower(kept[0])] {
 		name := strings.Join(kept, " ")
 		plain := strings.ToLower(name)
-		if size := utf8.RuneCountInString(name); size >= 2 && size <= 32 && !strings.ContainsAny(name, "0123456789@") &&
-			!strings.Contains(name, "'s ") && !strings.Contains(name, "’s ") &&
-			!containsAny(plain, []string{"atom", "rss", "feed"}) && !strings.Contains(plain, "generator") {
+		slug := strings.Contains(name, "-") && strings.Trim(name, "abcdefghijklmnopqrstuvwxyz0123456789-") == ""
+		if size := utf8.RuneCountInString(name); size >= 2 && size <= 32 && !slug &&
+			!strings.ContainsAny(name, "0123456789@") && !strings.Contains(name, "'s ") &&
+			!strings.Contains(name, "’s ") && !containsAny(plain, []string{"atom", "rss", "feed"}) &&
+			!strings.Contains(plain, "generator") {
 			return name
 		}
 	}
 	lowered := bytes.ToLower(body)
 	for _, row := range frameworkMarks {
-		if row[1] != "" && bytes.Contains(lowered, []byte(row[1])) {
+		if bytes.Contains(lowered, []byte(row[1])) {
 			return row[2]
 		}
 	}
@@ -621,27 +627,36 @@ func readFriends(body []byte, origin string) []Friend {
 	}
 	root, _ := url.Parse(origin)
 	site := registrableOf(normalizeHost(origin))
-	var friends []Friend
+	var order []*html.Node
+	bucket := map[*html.Node][]Friend{}
+	marked := map[*html.Node]bool{}
 	seen := map[string]bool{}
-	var walk func(*html.Node, string, bool)
-	walk = func(node *html.Node, section string, blocked bool) {
+	var walk func(*html.Node, string, bool, *html.Node)
+	walk = func(node *html.Node, section string, blocked bool, group *html.Node) {
 		if node.Type == html.ElementNode {
 			tag := strings.ToLower(node.Data)
 			if tag == "nav" || tag == "footer" || tag == "header" {
 				section = tag
 			}
-			if style := strings.ToLower(attrOf(node, "class") + " " + attrOf(node, "id")); style != "" {
+			style := strings.ToLower(attrOf(node, "class") + " " + attrOf(node, "id"))
+			friendly := containsAny(style, friendMarks) && !containsAny(style, friendSkipMarks)
+			if style != "" {
 				switch {
-				case containsAny(style, friendMarks) &&
-					!containsAny(style, friendHardSkips):
+				case friendly:
 					blocked = false
 				case containsAny(style, friendSkipMarks):
 					blocked = true
 				}
 			}
+			if tag == "ul" || tag == "ol" || friendly {
+				if _, exists := bucket[node]; !exists {
+					bucket[node] = nil
+					order = append(order, node)
+				}
+				group, marked[node] = node, friendly || marked[node]
+			}
 			if tag == "a" && !blocked && section != "nav" && section != "footer" && section != "header" {
 				rel := strings.ToLower(attrOf(node, "rel"))
-				style := strings.ToLower(attrOf(node, "class") + " " + attrOf(node, "id"))
 				parsed := resolveLink(attrOf(node, "href"), root)
 				if !blockedRelation(rel) && !containsAny(style, friendSkipMarks) && parsed != nil &&
 					(parsed.Scheme == "http" || parsed.Scheme == "https") &&
@@ -659,9 +674,15 @@ func readFriends(body []byte, origin string) []Friend {
 							containsAny(strings.ToLower(name), friendNameNoise) {
 							continue
 						}
-						if url := parsed.String(); !seen[url] {
-							seen[url] = true
-							friends = append(friends, Friend{Name: name, URL: url})
+						// 只保留主机地址
+						host := normalizeHost(parsed.Host)
+						if !seen[host] {
+							seen[host] = true
+							if _, exists := bucket[group]; !exists {
+								bucket[group] = nil
+								order = append(order, group)
+							}
+							bucket[group] = append(bucket[group], Friend{Name: name, URL: parsed.Scheme + "://" + host + "/"})
 						}
 						break
 					}
@@ -669,10 +690,17 @@ func readFriends(body []byte, origin string) []Friend {
 			}
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child, section, blocked)
+			walk(child, section, blocked, group)
 		}
 	}
-	walk(document, "", false)
+	walk(document, "", false, document)
+	var friends []Friend
+	for _, group := range order {
+		// 友链成组判定
+		if marked[group] || len(bucket[group]) >= 2 {
+			friends = append(friends, bucket[group]...)
+		}
+	}
 	return friends
 }
 
