@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -17,253 +19,81 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-// 排除平台博客
-var hubHosts = map[string]bool{
-	"github.com": true, "gitlab.com": true, "gitee.com": true, "bitbucket.org": true,
-	"stackoverflow.com": true, "stackexchange.com": true, "segmentfault.com": true, "quora.com": true,
-	"zhihu.com": true, "juejin.cn": true, "csdn.net": true, "cnblogs.com": true,
-	"oschina.net": true, "jianshu.com": true, "wanandroid.com": true, "v2ex.com": true,
-	"hostloc.com": true, "nodeseek.com": true, "linux.do": true, "52pojie.cn": true,
-	"ituring.com.cn": true, "weibo.com": true, "facebook.com": true, "twitter.com": true,
-	"x.com": true, "youtube.com": true, "instagram.com": true, "pinterest.com": true,
-	"reddit.com": true, "tumblr.com": true, "linkedin.com": true, "douban.com": true,
-	"bilibili.com": true, "xiaohongshu.com": true, "douyin.com": true, "kuaishou.com": true,
-	"toutiao.com": true, "t.me": true, "telegram.org": true, "discord.com": true,
-	"discord.gg": true, "medium.com": true, "baidu.com": true, "qq.com": true,
-	"weixin.qq.com": true, "mp.weixin.qq.com": true, "sina.com.cn": true, "sina.com": true,
-	"sohu.com": true, "163.com": true, "ifeng.com": true, "bing.com": true,
-	"google.com": true, "msn.com": true, "yahoo.com": true, "yandex.com": true,
-	"microsoft.com": true, "apple.com": true, "amazon.com": true, "wikipedia.org": true,
-	"mozilla.org": true, "adobe.com": true, "oracle.com": true, "ibm.com": true,
-	"intel.com": true, "nvidia.com": true, "samsung.com": true, "huawei.com": true,
-	"xiaomi.com": true, "alibaba.com": true, "taobao.com": true, "tmall.com": true,
-	"jd.com": true, "pinduoduo.com": true, "meituan.com": true, "tencent.com": true,
-	"netease.com": true, "chromium.org": true, "android.com": true, "python.org": true,
-	"golang.org": true, "rust-lang.org": true, "nodejs.org": true, "npmjs.com": true,
-	"docker.com": true, "kubernetes.io": true, "apache.org": true, "gnu.org": true,
-	"sourceforge.net": true, "vercel.com": true, "netlify.com": true, "akamai.com": true,
-	"fastly.com": true, "aliyun.com": true, "feedly.com": true, "slashdot.org": true,
-	"caniuse.com": true, "mit.edu": true, "sdf.org": true, "mastodon.social": true,
-	"wordpress.com": true, "blogspot.com": true, "foreverblog.cn": true, "storeweb.cn": true,
-	"listbox.app": true, "urschool.org": true, "cafenomad.tw": true, "atom.com": true,
-	"hugedomains.com": true, "godaddy.com": true, "dan.com": true, "afternic.com": true,
-	"sedo.com": true, "sav.com": true, "namecheap.com": true, "dynadot.com": true,
-	"namesilo.com": true, "porkbun.com": true, "gname.com": true, "linktr.ee": true,
-	"notion.site": true, "notion.so": true, "carrd.co": true, "coursera.org": true,
-	"kagi.com": true, "nusmods.com": true, "xiaobot.net": true, "jiumodiary.com": true,
-	"letitfly.me": true, "mysmth.net": true, "51cto.com": true, "infoq.cn": true,
-	"icourse163.org": true, "zhihuishu.com": true, "nowcoder.com": true, "apifox.com": true,
-	"gitbook.io": true, "readthedocs.io": true, "jetbrains.com": true, "deepin.org": true,
-	"openai.com": true, "anthropic.com": true, "claude.ai": true, "3m.com": true,
-	"53.com": true, "abbott.com": true, "abm.com": true, "about.deere.com": true,
-	"adm.com": true, "aecom.com": true, "aep.com": true, "aes.com": true,
-	"afginc.com": true, "aig.com": true, "airproducts.com": true, "albemarle.com": true,
-	"albertsons.com": true, "alcoa.com": true, "allstatecorporation.com": true, "ally.com": true,
-	"alticeusacareers.com": true, "altria.com": true, "ameren.com": true, "americanexpress.com": true,
-	"americantower.com": true, "ameriprise.com": true, "amfam.com": true, "amphenol.com": true,
-	"analog.com": true, "andersonscustard.com": true, "apa.org": true, "apollo.com": true,
-	"appliedmaterials.com": true, "arkocorp.com": true, "asburycareers.com": true, "auto-owners.com": true,
-	"autoliv.com": true, "averydennison.com": true, "ball.com": true, "baxter.com": true,
-	"berkley.com": true, "berryglobal.com": true, "bhspecialty.com": true, "biogen.com": true,
-	"blackstone.com": true, "block.xyz": true, "bnymellon.com": true, "bookingholdings.com": true,
-	"borgwarner.com": true, "bostonscientific.com": true, "broadcom.com": true, "burlington.com": true,
-	"caesars.com": true, "capitalonecareers.com": true, "cardinalhealth.com": true, "careers-brightspring.icims.com": true,
-	"careers-pplweb.icims.com": true, "careersatfm.com": true, "carvana.com": true, "caseys.com": true,
-	"caterpillar.com": true, "cbrands.wd5.myworkdayjobs.com": true, "cbre.com": true, "cdwjobs.com": true,
-	"celanese.com": true, "cencora.com": true, "cheniere.com": true, "chk.com": true,
-	"chs.net": true, "cinfin.com": true, "cintas.com": true, "cisco.com": true,
-	"clr.com": true, "cmsenergy.com": true, "coca-colacompany.com": true, "coned.com": true,
-	"corning.com": true, "costco.com": true, "csx.com": true, "cummins.com": true,
-	"darden.com": true, "delta.com": true, "devonenergy.com": true, "diamondbackenergy.com": true,
-	"disneycareers.com": true, "drhorton.com": true, "dteenergy.com": true, "duke-energy.com": true,
-	"ea.com": true, "eastman.com": true, "echostarcareers.com": true, "edisoncareers.com": true,
-	"elcompanies.com": true, "emcorgroup.com": true, "emerson.com": true, "energytransfer.com": true,
-	"enterpriseproducts.com": true, "equitable.com": true, "erieinsurance.com": true, "expeditors.com": true,
-	"fanniemae.com": true, "farmers.com": true, "fcx.com": true, "firstenergycorp.com": true,
-	"fluor.com": true, "fnf.com": true, "foxcareers.com": true, "franklintempletoncareers.com": true,
-	"gapinc.com": true, "gd.com": true, "genworth.com": true, "gilead.com": true,
-	"goldmansachs.com": true, "graphicpkg.com": true, "graybar.com": true, "group1careers.com": true,
-	"guardianlife.com": true, "gxo.com": true, "hcwx.fa.us2.oraclecloud.com": true, "henryschein.com": true,
-	"hercjobs.org": true, "hess.com": true, "hii.com": true, "hormelfoods.com": true,
-	"huntington.com": true, "ice.com": true, "ielp.com": true, "iff.com": true,
-	"ingredion.com": true, "insight.com": true, "interactivebrokers.com": true, "interpublic.com": true,
-	"intuit.com": true, "ir.marathonpetroleum.com": true, "jefferies.com": true, "jmsmucker.com": true,
-	"jobs-ups.com": true, "jpmorganchase.com": true, "json.amark.com": true, "key.com": true,
-	"kiewitcareers.kiewit.com": true, "kindermorgan.com": true, "kkr.com": true, "kla.com": true,
-	"krogerfamilycareers.com": true, "kyndryl.com": true, "lear.com": true, "libertymedia.com": true,
-	"livenationentertainment.com": true, "lkqcorp.com": true, "lockheedmartin.com": true, "lpl.com": true,
-	"macysinc.com": true, "manpowergroup.com": true, "markel.com": true, "metacareers.com": true,
-	"metlifecareers.com": true, "microchip.com": true, "micron.com": true, "molsoncoors.com": true,
-	"mondelezinternational.com": true, "monsterenergy.com": true, "morganstanley.com": true, "mosaicco.com": true,
-	"motorolasolutions.com": true, "mtb.com": true, "murphyusa.com": true, "mutualofomaha.com": true,
-	"my.avnet.com": true, "mycareer.verizon.com": true, "nationwide.com": true, "newscorp.com": true,
-	"nglenergypartners.com": true, "norfolksouthern.com": true, "northerntrust.com": true, "northropgrumman.com": true,
-	"northwesternmutual.com": true, "nov.com": true, "nrg.com": true, "nucor.com": true,
-	"nvrcareers.com": true, "o-i.com": true, "oldrepublictitle.com": true, "omnicommediagroup.com": true,
-	"oneok.com": true, "onsemi.com": true, "oshkoshcorp.com": true, "otis.com": true,
-	"ovintiv.com": true, "owens-minor.com": true, "oxy.com": true, "pacificlife.com": true,
-	"pagjobs.com": true, "paramount.com": true, "parker.com": true, "parpacific.com": true,
-	"pbfenergy.com": true, "pepsicojobs.com": true, "performancefoodservice.com": true, "pfizer.com": true,
-	"pgcareers.com": true, "phillips66.com": true, "plains.com": true, "pmi.com": true,
-	"polaris.com": true, "ppg.com": true, "principal.com": true, "progressive.com": true,
-	"prologis.com": true, "pultegroupinc.com": true, "pxd.com": true, "quantaservices.com": true,
-	"raymondjames.com": true, "rgare.com": true, "rockwellautomation.com": true, "rushenterprises.com": true,
-	"ryder.com": true, "sands.com": true, "schwabjobs.com": true, "seaboardcorp.com": true,
-	"searchjobs.libertymutualgroup.com": true, "securian.com": true, "sempra.com": true, "skechers.wd5.myworkdayjobs.com": true,
-	"spglobal.com": true, "stanleyblackanddecker.com": true, "steeldynamics.com": true, "stonex.com": true,
-	"storejobapplication.publix.com": true, "synchronycareers.com": true, "targaresources.com": true, "tenethealth.com": true,
-	"tesla.com": true, "thecloroxcompany.com": true, "thehartford.com": true, "thorindustries.com": true,
-	"tjx.com": true, "tollcareercenter.com": true, "tractorsupply.careers": true, "tysonfoods.com": true,
-	"uber.com": true, "ufpi.com": true, "us-jobs.crowncork.com": true, "us.jll.com": true,
-	"usaajobs.com": true, "usfoods.com": true, "ussteel.com": true, "valero.com": true,
-	"vfc.com": true, "viatris.com": true, "vistracorp.com": true, "voya.com": true,
-	"vrtx.com": true, "vulcanmaterials.com": true, "walgreensbootsalliance.com": true, "watsco.com": true,
-	"wayfair.com": true, "wecenergygroup.com": true, "wellsfargo.com": true, "wesco.com": true,
-	"westernsouthern.com": true, "westlaketalent.com": true, "westrock.com": true, "weyerhaeuser.com": true,
-	"whirlpoolcareers.com": true, "williams-sonomainc.com": true, "williams.com": true, "wm.com": true,
-	"workday.com": true, "world-kinect.com": true, "xylem.com": true, "yum.com": true,
-	"zoetis.com": true,
-}
-
-// 资源统计域名
-var noiseHosts = map[string]bool{
-	"gstatic.com": true, "googleapis.com": true, "googleusercontent.com": true, "ggpht.com": true,
-	"gravatar.com": true, "wp.com": true, "w.org": true, "typekit.net": true,
-	"fontawesome.com": true, "jsdelivr.net": true, "unpkg.com": true, "cdnjs.com": true,
-	"bootcdn.net": true, "bootcss.com": true, "staticfile.org": true, "statically.io": true,
-	"bootstrapcdn.com": true, "aspnetcdn.com": true, "cloudflare.com": true, "cloudfront.net": true,
-	"fastly.net": true, "akamaihd.net": true, "akamai.net": true, "azureedge.net": true,
-	"bunnycdn.com": true, "gcorelabs.com": true, "alicdn.com": true, "aliyuncs.com": true,
-	"myqcloud.com": true, "upyun.com": true, "qiniucdn.com": true, "qiniudn.com": true,
-	"bdstatic.com": true, "126.net": true, "127.net": true, "xhscdn.com": true,
-	"dusays.com": true, "sm.ms": true, "google-analytics.com": true, "googletagmanager.com": true,
-	"doubleclick.net": true, "sentry.io": true, "hotjar.com": true, "mixpanel.com": true,
-	"segment.io": true, "amplitude.com": true, "clarity.ms": true, "umami.is": true,
-	"plausible.io": true, "matomo.cloud": true, "cnzz.com": true, "umeng.com": true,
-	"umengcloud.com": true, "ibruce.info": true, "51.la": true, "cloudflareinsights.com": true,
-	"vercount.one": true, "disqus.com": true, "addthis.com": true, "sharethis.com": true,
-	"addtoany.com": true, "giscus.app": true, "utterances.es": true, "twikoo.com": true,
-	"waline.js.org": true, "valine.js.org": true, "artalk.js.org": true, "livere.com": true,
-	"changyan.com": true, "geetest.com": true, "vaptcha.com": true, "hcaptcha.com": true,
-	"recaptcha.net": true, "imgur.com": true, "imgbb.com": true, "sinaimg.cn": true,
-	"zhimg.com": true, "gtimg.cn": true, "hdslb.com": true, "doubanio.com": true,
-	"byteimg.com": true, "pstatp.com": true, "fbcdn.net": true, "twimg.com": true,
-	"ytimg.com": true, "cdninstagram.com": true, "pinimg.com": true, "licdn.com": true,
-	"zstatic.com": true, "githubassets.com": true, "githubusercontent.com": true,
-}
-
-// 屏蔽域名后缀
-var blockedSuffixes = []string{".gov", ".mil", ".local", ".localhost", ".test", ".invalid",
-	".example", ".internal", ".home", ".lan", ".onion", ".jobs",
-	".edu", ".edu.cn", ".ac.uk", ".ac.jp", ".ac.nz",
-	".edu.au", ".edu.hk", ".edu.tw", ".edu.sg"}
+// 排除域名集合
+var blockHosts = map[string]bool{}
 
 // 页面拦截词表
-var blockWords = []string{"404", "not found", "页面不存在", "找不到页面", "页面未找到", "access denied",
-	"welcome to nginx", "index of", "default web site page", "站点未找到", "网站未找到",
-	"域名出售", "域名停放", "域名已过期", "已到期", "请续费", "该域名正在出售",
+var blockWords = []string{"页面不存在", "找不到页面", "页面未找到", "站点未找到", "网站未找到", "域名出售", "域名停放", "域名已过期",
+	"已到期", "请续费", "该域名正在出售", "建站中", "维护中", "敬请期待", "网址导航", "搜索引擎", "无法访问", "暂时无法", "买球", "赌球",
+	"棋牌", "娱乐城", "博彩", "下注", "彩票", "球盘", "让球", "体育投注", "开户", "万博", "免费观看", "在线观看", "影院", "招聘", "招贤",
+	"404", "not found", "access denied", "welcome to nginx", "index of", "default web site page",
 	"domain for sale", "this domain is for sale", "buy this domain", "domain expired",
-	"account suspended", "site not found", "under construction",
-	"网站维护中", "建站中", "维护中", "coming soon", "敬请期待", "网址导航", "搜索引擎",
-	"无法访问", "暂时无法", "will go into a meta tag", "recent content on ",
-	"买球", "赌球", "棋牌", "娱乐城", "博彩", "下注", "彩票", "球盘", "让球", "体育投注",
-	"开户", "万博", "manbext", "slot", "judi", "bandar", "prediksi", "gacor",
-	"免费观看", "在线观看", "影院",
-	"careers", "career", "jobs", "job", "recruiting", "recruitment", "talent",
-	"apply", "hiring", "corporate", "search-careers", "searchjobs",
-	"招聘", "招贤", "人才招聘", "校园招聘", "社会招聘"}
-
-// 归档页面提示
-var archiveHints = []string{"archive", "归档", "分页", "/page/", "older", "newer"}
-
-// 订阅识别标记
-var feedMarks = []string{"atom", "rss", "feed", "feed+json"}
-
-// 友链识别标记
-var friendMarks = []string{"友链", "友情链接", "友邻", "朋友", "friend", "blogroll",
-	"links", "link", "友情", "blogmate", "blogger"}
-
-// 名称识别标记
-var nameMarks = []string{"name", "title", "sitename", "site-name", "nickname"}
-
-// 噪声节点标记
-var friendSkipMarks = []string{"nav", "menu", "footer", "header", "social", "share", "comment",
-	"breadcrumb", "pagination", "copyright", "credit", "powered", "widget", "sidebar", "toolbar",
-	"privacy", "policy", "agreement", "cookie", "legal", "disclaimer", "terms", "third-party", "thirdparty"}
-
-// 强噪声标识
-var friendHardSkips = []string{"footer", "header", "navbar", "menu", "privacy", "policy", "copyright",
-	"breadcrumb", "pagination", "social", "share", "comment"}
-
-// 友链名称噪声
-var friendNameNoise = []string{"申请友链", "友链申请", "交换友链", "申请", "添加", "提交", "首页", "home",
-	"更多", "more", "返回", "back", "上一页", "下一页", "next", "prev", "阅读全文", "read more",
-	"评论", "留言", "关于", "about", "归档", "archive", "标签", "tag", "分类", "category",
-	"订阅", "rss", "登录", "注册", "搜索", "search", "友情链接", "友链"}
-
-// 作者识别标记
-var authorMarks = []string{"author", "byline", "vcard"}
-
-// 作者名称噪声
-var authorNoise = map[string]bool{
-	"by": true, "posted by": true, "admin": true, "administrator": true, "author": true,
-	"unknown": true, "anonymous": true, "none": true, "n/a": true, "na": true,
-	"互动": true, "评论": true, "登录": true, "注册": true, "分享": true, "首页": true,
-	"投稿": true, "作者": true, "博主": true, "日期": true, "时间": true, "張貼者": true, "张贴者": true,
-}
-
-// 作者名称前缀
-var authorPrefixes = []string{"作者是", "作者：", "作者:", "by ", "posted by ", "written by ", "文/", "文："}
+	"account suspended", "under construction", "coming soon", "will go into a meta tag",
+	"recent content on ", "slot", "careers", "career", "jobs", "job", "recruiting",
+	"recruitment", "talent", "apply", "hiring", "corporate", "search-careers", "searchjobs"}
 
 // 文本截断词表
-var cutWords = []string{"，", "。", "！", "？", "；", "：", "、", "…", "“", "”", "—", "–", ",", ";", "<", "（", "(",
-	"powered by", "built with", "generated by", "©", "copyright", "all rights", "备案", "保留", "icp"}
+var cutWords = []string{"，", "。", "！", "？", "；", "：", "、", "…", "“",
+	"”", "—", "–", "（", "©", "备案", "保留", ",", ";", "<", "(", "powered by",
+	"built with", "generated by", "copyright", "all rights", "icp"}
 
-// 版权信息噪声
-var copyrightNoise = []string{"·", "•", "|", "｜", "/", "访客", "评论", "登录", "搜索", "rss", "design", "theme"}
+// 噪声节点标记
+var friendSkipMarks = []string{"nav", "menu", "footer", "header", "social",
+	"share", "comment", "breadcrumb", "pagination", "copyright", "credit",
+	"powered", "widget", "sidebar", "toolbar", "privacy", "policy", "agreement",
+	"cookie", "legal", "disclaimer", "terms", "third-party", "thirdparty"}
+
+// 强噪声标识
+var friendHardSkips = []string{"footer", "header", "navbar", "menu", "privacy",
+	"policy", "copyright", "breadcrumb", "pagination", "social", "share", "comment"}
+
+// 友链名称噪声
+var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "上一页", "下一页", "阅读全文",
+	"评论", "留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链", "home",
+	"more", "back", "next", "prev", "about", "archive", "tag", "category", "rss", "search"}
+
+// 友链识别标记
+var friendMarks = []string{"友链", "友情链接", "友邻", "朋友", "友情",
+	"friend", "blogroll", "link", "blogmate", "blogger"}
+
+// 作者名称噪声
+var authorNoise = map[string]bool{"互动": true, "评论": true, "登录": true, "注册": true, "分享": true,
+	"首页": true, "投稿": true, "作者": true, "博主": true, "日期": true, "时间": true, "張貼者": true,
+	"张贴者": true, "by": true, "posted by": true, "admin": true, "administrator": true,
+	"author": true, "unknown": true, "anonymous": true, "none": true, "n/a": true, "na": true}
 
 // 框架名称噪声
-var frameworkNoise = map[string]bool{
-	"by": true, "with": true, "using": true, "powered": true, "and": true, "the": true,
-	"for": true, "on": true, "in": true, "a": true, "an": true, "built": true, "version": true,
-}
+var frameworkNoise = map[string]bool{"by": true, "with": true, "using": true,
+	"powered": true, "and": true, "the": true, "for": true, "on": true,
+	"in": true, "a": true, "an": true, "built": true, "version": true}
 
 // 框架识别特征
-var frameworkMarks = [][3]string{
-	{"wordpress", "wp-content", "WordPress"},
-	{"typecho", "/usr/themes/", "Typecho"},
-	{"hexo", "hexo-theme", "Hexo"},
-	{"hugo", "", "Hugo"},
-	{"jekyll", "", "Jekyll"},
-	{"astro", "/_astro/", "Astro"},
-	{"next.js", "_next/", "Next.js"},
-	{"nuxt", "/_nuxt/", "Nuxt"},
-	{"gatsby", "___gatsby", "Gatsby"},
-	{"ghost", "/assets/built/", "Ghost"},
-	{"vuepress", "vuepress", "VuePress"},
-	{"vitepress", "vitepress", "VitePress"},
-	{"docusaurus", "docusaurus", "Docusaurus"},
-	{"gridea", "gridea", "Gridea"},
-	{"halo", "halo-theme", "Halo"},
-	{"zblog", "zblog", "Z-Blog"},
-	{"emlog", "emlog", "Emlog"},
-	{"docsify", "docsify", "Docsify"},
-	{"mkdocs", "mkdocs", "MkDocs"},
-	{"eleventy", "eleventy", "Eleventy"},
-	{"sveltekit", "__sveltekit", "SvelteKit"},
-	{"remix", "__remix", "Remix"},
-	{"pelican", "", "Pelican"},
-	{"zola", "", "Zola"},
-}
+var frameworkMarks = [][3]string{{"wordpress", "wp-content", "WordPress"},
+	{"typecho", "/usr/themes/", "Typecho"}, {"hexo", "hexo-theme", "Hexo"},
+	{"hugo", "", "Hugo"}, {"jekyll", "", "Jekyll"}, {"astro", "/_astro/", "Astro"},
+	{"next.js", "_next/", "Next.js"}, {"nuxt", "/_nuxt/", "Nuxt"}, {"gatsby", "___gatsby", "Gatsby"},
+	{"ghost", "/assets/built/", "Ghost"}, {"vuepress", "vuepress", "VuePress"},
+	{"vitepress", "vitepress", "VitePress"}, {"docusaurus", "docusaurus", "Docusaurus"},
+	{"gridea", "gridea", "Gridea"}, {"halo", "halo-theme", "Halo"}, {"zblog", "zblog", "Z-Blog"},
+	{"emlog", "emlog", "Emlog"}, {"docsify", "docsify", "Docsify"}, {"mkdocs", "mkdocs", "MkDocs"},
+	{"eleventy", "eleventy", "Eleventy"}, {"sveltekit", "__sveltekit", "SvelteKit"},
+	{"remix", "__remix", "Remix"}, {"pelican", "", "Pelican"}, {"zola", "", "Zola"}}
 
 // 通用标题词表
-var genericNames = map[string]bool{
-	"首页": true, "主页": true, "网站首页": true, "home": true, "homepage": true,
-	"blog": true, "index": true, "untitled": true, "start": true, "welcome": true, "欢迎": true,
-	"description": true, "posts": true, "just a moment": true,
-	"博客": true, "频道": true, "关于": true, "个人博客": true, "我的博客": true,
-	"网站主页": true, "about": true, "about me": true, "main": true, "portal": true,
-}
+var genericNames = map[string]bool{"首页": true, "主页": true, "网站首页": true,
+	"欢迎": true, "博客": true, "频道": true, "关于": true, "个人博客": true, "我的博客": true,
+	"网站主页": true, "home": true, "homepage": true, "blog": true, "index": true,
+	"untitled": true, "start": true, "welcome": true, "description": true, "posts": true,
+	"just a moment": true, "about": true, "about me": true, "main": true, "portal": true}
+
+// 标签剥离正则
+var htmlTag = regexp.MustCompile(`<[^>]*>`)
+
+// 版权行正则
+var copyrightMark = regexp.MustCompile(`(?i)(?:©|\(c\)|copyright)\s*(?:\d{4}(?:\s*[-–~至]\s*\d{4})?)?\s*`)
+
+// 备案号正则
+var icpMark = regexp.MustCompile(`[\p{Han}]?ICP备\d+号|公网安备\d+号`)
 
 // 首页信息结构
 type Home struct {
@@ -364,6 +194,21 @@ type Friend struct {
 	URL  string
 }
 
+// 载入排除域名
+func init() {
+	body, failure := os.ReadFile("data/host.txt")
+	if failure != nil {
+		return
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		host := strings.ToLower(strings.TrimSpace(line))
+		if host == "" || strings.HasPrefix(host, "#") {
+			continue
+		}
+		blockHosts[host] = true
+	}
+}
+
 // 检查拦截词语
 func blockedText(text string) bool {
 	return containsAny(strings.ToLower(text), blockWords)
@@ -382,8 +227,7 @@ func blockedHost(host string) bool {
 // 筛选友链候选
 func friendWorthy(host, site string) bool {
 	neighbor := registrableOf(host)
-	return neighbor != "" && neighbor != site && !inDomainSet(host, hubHosts) &&
-		!inDomainSet(host, noiseHosts) && !blockedHost(host)
+	return neighbor != "" && neighbor != site && !inDomainSet(host, blockHosts) && !blockedHost(host)
 }
 
 // 规范化主机名
@@ -460,18 +304,20 @@ func HostOf(host string) string {
 	if host == "" {
 		return ""
 	}
+	host = strings.ToLower(host)
 	if _, failure := netip.ParseAddr(host); failure == nil {
 		return ""
 	}
 	if len(host) > 253 || !strings.Contains(host, ".") {
 		return ""
 	}
-	for _, suffix := range blockedSuffixes {
-		if strings.HasSuffix(host, suffix) || strings.Contains(host, suffix+".") {
+	suffixes := []string{"localhost", "local", "gov", "mil", "test", "invalid", "example", "internal", "home", "lan", "onion", "jobs"}
+	for _, label := range strings.Split(host, ".")[1:] {
+		if slices.Contains(suffixes, label) {
 			return ""
 		}
 	}
-	if inDomainSet(host, noiseHosts) {
+	if inDomainSet(host, blockHosts) {
 		return ""
 	}
 	return host
@@ -494,7 +340,7 @@ func classify(site *BlogSite, page Home, result *Result, done bool) (string, str
 		}
 		return "other", "页面错误"
 	case done && (page.SinglePost && !page.HasArchive ||
-		plain && (inDomainSet(site.Host, hubHosts) || label == "" || genericName(label))):
+		plain && (inDomainSet(site.Host, blockHosts) || label == "" || genericName(label))):
 		return "other", "其它站点"
 	}
 	return "", ""
@@ -577,7 +423,7 @@ func tidyTitle(text string) string {
 
 // 清理摘要内容
 func summaryText(text string) string {
-	word := collapse(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(html.UnescapeString(text), " "))
+	word := collapse(htmlTag.ReplaceAllString(html.UnescapeString(text), " "))
 	lower := strings.ToLower(word)
 	if utf8.RuneCountInString(word) < 4 || blockedText(lower) || genericName(lower) {
 		return ""
@@ -592,7 +438,7 @@ func authorName(text string, refs ...string) string {
 		return ""
 	}
 	word = cutAt(word, cutWords)
-	for _, prefix := range authorPrefixes {
+	for _, prefix := range []string{"作者是", "作者：", "作者:", "文/", "文：", "by ", "posted by ", "written by "} {
 		word = strings.TrimSpace(strings.TrimPrefix(word, prefix))
 	}
 	if index := strings.LastIndex(strings.ToLower(word), " by "); index >= 0 {
@@ -669,7 +515,7 @@ func detectFramework(stated string, body []byte) string {
 		plain := strings.ToLower(name)
 		if size := utf8.RuneCountInString(name); size >= 2 && size <= 32 && !strings.ContainsAny(name, "0123456789@") &&
 			!strings.Contains(name, "'s ") && !strings.Contains(name, "’s ") &&
-			!containsAny(plain, feedMarks) && !strings.Contains(plain, "generator") {
+			!containsAny(plain, []string{"atom", "rss", "feed"}) && !strings.Contains(plain, "generator") {
 			return name
 		}
 	}
@@ -686,7 +532,7 @@ func detectFramework(stated string, body []byte) string {
 func (scan *linkScan) visit(node *html.Node, link, section string, page *Home) {
 	entry := deepText(node)
 	if !page.HasArchive {
-		page.HasArchive = containsAny(strings.ToLower(link+" "+entry), archiveHints)
+		page.HasArchive = containsAny(strings.ToLower(link+" "+entry), []string{"归档", "分页", "archive", "/page", "older", "newer"})
 	}
 	parsed := resolveLink(link, scan.root)
 	if parsed == nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -698,7 +544,7 @@ func (scan *linkScan) visit(node *html.Node, link, section string, page *Home) {
 		scan.cache[parsed.Host] = hostname
 	}
 	if page.Feed == "" && registrableOf(hostname) == scan.registrable &&
-		containsAny(strings.ToLower(parsed.Path+"?"+parsed.RawQuery), feedMarks) {
+		containsAny(strings.ToLower(parsed.Path+"?"+parsed.RawQuery), []string{"atom", "rss", "feed"}) {
 		page.Feed = parsed.String()
 	}
 	rel := strings.ToLower(attrOf(node, "rel"))
@@ -710,7 +556,8 @@ func (scan *linkScan) visit(node *html.Node, link, section string, page *Home) {
 	page.HasLinks = true
 	if registrableOf(hostname) == scan.registrable {
 		lower := strings.ToLower(entry + " " + parsed.Path)
-		if strings.Contains(rel, "friend") || strings.Contains(rel, "blogroll") || containsAny(lower, friendMarks) {
+		if strings.Contains(rel, "friend") || strings.Contains(rel, "blogroll") ||
+			containsAny(lower, friendMarks) {
 			page.Friends = append(page.Friends, parsed.String())
 		}
 	}
@@ -785,7 +632,8 @@ func readFriends(body []byte, origin string) []Friend {
 			}
 			if style := strings.ToLower(attrOf(node, "class") + " " + attrOf(node, "id")); style != "" {
 				switch {
-				case containsAny(style, friendMarks) && !containsAny(style, friendHardSkips):
+				case containsAny(style, friendMarks) &&
+					!containsAny(style, friendHardSkips):
 					blocked = false
 				case containsAny(style, friendSkipMarks):
 					blocked = true
@@ -804,7 +652,7 @@ func readFriends(body []byte, origin string) []Friend {
 					}); img != nil {
 						alt = collapse(attrOf(img, "alt"))
 					}
-					for _, candidate := range []string{markedText(node, nameMarks), alt, attrOf(node, "title"), deepText(node)} {
+					for _, candidate := range []string{markedText(node, []string{"name", "title"}), alt, attrOf(node, "title"), deepText(node)} {
 						name := strings.Trim(collapse(html.UnescapeString(candidate)), " \t\\-–—_|｜/·»•・~")
 						size := utf8.RuneCountInString(name)
 						if size < 2 || size > 32 || strings.Contains(name, "://") || strings.ContainsAny(name, "©@") ||
@@ -898,7 +746,7 @@ func readPage(body []byte, origin string) Home {
 			case "link":
 				kind, link := strings.ToLower(attrOf(node, "type")), attrOf(node, "href")
 				if page.Feed == "" && link != "" && strings.Contains(strings.ToLower(attrOf(node, "rel")), "alternate") &&
-					containsAny(kind, feedMarks) {
+					containsAny(kind, []string{"atom", "rss", "feed"}) {
 					if parsed := resolveLink(link, root); parsed != nil {
 						page.Feed = parsed.String()
 					}
@@ -912,8 +760,8 @@ func readPage(body []byte, origin string) Home {
 			default:
 				if info.domAuthor == "" && tag != "article" && tag != "h1" && tag != "h2" {
 					style := strings.ToLower(attrOf(node, "class") + " " + attrOf(node, "id"))
-					if containsAny(style, authorMarks) {
-						info.domAuthor = pickFirst(markedText(node, nameMarks), deepText(node))
+					if containsAny(style, []string{"author", "byline", "vcard"}) {
+						info.domAuthor = pickFirst(markedText(node, []string{"name", "title"}), deepText(node))
 					}
 				}
 			}
@@ -1004,16 +852,16 @@ func readPage(body []byte, origin string) Home {
 	accept := func(candidate string) string { return authorName(candidate, host) }
 	page.Author = pickFirst(accept(info.author), accept(jsonAuthor), accept(info.domAuthor), accept(info.address))
 	if page.Author == "" {
-		if match := regexp.MustCompile(`(?i)(?:©|\(c\)|copyright)\s*(?:\d{4}(?:\s*[-–~至]\s*\d{4})?)?\s*`).FindStringIndex(visible); match != nil {
+		if match := copyrightMark.FindStringIndex(visible); match != nil {
 			phrase := collapse(cutAt(visible[match[1]:], cutWords))
 			phrase = strings.Trim(phrase, " \t:：-—、,.。;；")
-			if !containsAny(strings.ToLower(phrase), copyrightNoise) && nameOK(phrase, 32, 6) &&
+			if !containsAny(strings.ToLower(phrase), []string{"访客", "评论", "登录", "搜索", "·", "•", "|", "｜", "/", "rss", "design", "theme"}) && nameOK(phrase, 32, 6) &&
 				!strings.ContainsAny(phrase, "0123456789@©") {
 				page.Author = accept(phrase)
 			}
 		}
 	}
-	if match := regexp.MustCompile(`[\p{Han}]?ICP备\d+号|公网安备\d+号`).Find(body); match != nil {
+	if match := icpMark.Find(body); match != nil {
 		page.ICP = string(match)
 	}
 	if info.summary != "" {

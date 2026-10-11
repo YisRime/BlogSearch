@@ -77,7 +77,7 @@ func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	valid := make([]string, 0, len(hosts))
 	for _, raw := range hosts {
 		host := HostOf(raw)
-		if host == "" || inDomainSet(host, hubHosts) {
+		if host == "" || inDomainSet(host, blockHosts) {
 			continue
 		}
 		valid = append(valid, host)

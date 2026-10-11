@@ -138,7 +138,7 @@ func SeedBlogs(table *BlogTable) error {
 	for _, entry := range document.Blogs {
 		host := normalizeHost(entry.URL)
 		registrable := registrableOf(host)
-		if host == "" || inDomainSet(host, hubHosts) {
+		if host == "" || inDomainSet(host, blockHosts) {
 			continue
 		}
 		host = HostOf(host)

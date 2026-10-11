@@ -30,26 +30,21 @@ import (
 
 // 订阅探测路径
 var feedPaths = []string{
-	"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/feed/", "/rss.xml",
-	"/rss", "/rss/", "/atom", "/index.atom", "/index.rss", "/blog/feed",
+	"/atom.xml", "/index.xml", "/feed.xml", "/feed", "/rss.xml",
+	"/rss", "/atom", "/index.atom", "/index.rss", "/blog/feed",
 }
 
 // 友链探测路径
 var friendPaths = []string{
 	"/links", "/friends", "/link", "/friend", "/blogroll",
-	"/links/", "/friends/", "/links.html", "/friends.html", "/friendlinks",
+	"/links.html", "/friends.html", "/friendlinks",
 }
 
-// 站点地图标记
-var sitemapPaths = []string{"/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/index.xml"}
+// 跳转元标记
+var metaJump = regexp.MustCompile(`(?is)<meta[^>]+content\s*=\s*["']?\s*\d+\s*;\s*url\s*=\s*([^"'>\s]+)`)
 
-// 拦截特征表
-var shieldMarks = [][2]string{
-	{"just a moment", "挑战"}, {"cf-challenge", "挑战"}, {"challenge-platform", "挑战"},
-	{"_cf_chl_", "挑战"}, {"cf_chl_opt", "挑战"}, {"checking your browser", "挑战"},
-	{"enable javascript and cookies", "挑战"}, {"please wait while we check", "挑战"},
-	{"attention required", "拦截"}, {"ddos protection by", "拦截"}, {"under attack mode", "拦截"},
-}
+// 跳转脚本标记
+var scriptJump = regexp.MustCompile(`(?is)location\s*\.\s*(?:href\s*=\s*|replace\s*\(\s*|assign\s*\(\s*)["']([^"']+)["']`)
 
 // 解析绝对地址
 func absoluteURL(raw, base string) string {
@@ -326,10 +321,10 @@ func (scout *Scout) hop(task context.Context, result *Result, start string, deep
 			case len(reply.Body) < 4096:
 				fromBody = true
 				// 页面跳转信息
-				if match := regexp.MustCompile(`(?is)<meta[^>]+content\s*=\s*["']?\s*\d+\s*;\s*url\s*=\s*([^"'>\s]+)`).FindSubmatch(reply.Body); match != nil {
+				if match := metaJump.FindSubmatch(reply.Body); match != nil {
 					raw = string(match[1])
 					// 脚本跳转信息
-				} else if match := regexp.MustCompile(`(?is)location\s*\.\s*(?:href\s*=\s*|replace\s*\(\s*|assign\s*\(\s*)["']([^"']+)["']`).FindSubmatch(reply.Body); match != nil {
+				} else if match := scriptJump.FindSubmatch(reply.Body); match != nil {
 					raw = string(match[1])
 				}
 			}
@@ -425,7 +420,7 @@ func (scout *Scout) walkHops(task context.Context, site *BlogSite, result *Resul
 		case hostname == "":
 			mark(result, "pend", "地址无效", "")
 			return true
-		case inDomainSet(hostname, hubHosts):
+		case inDomainSet(hostname, blockHosts):
 			mark(result, "dead", "其它跳转", "")
 			return true
 		}
@@ -470,19 +465,15 @@ func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, r
 		kind = "丢弃"
 	default:
 		head := strings.ToLower(string(reply.Body[:min(len(reply.Body), 8192)]))
-		for _, row := range shieldMarks {
-			if strings.Contains(head, row[0]) {
-				kind = row[1]
-				break
-			}
-		}
-		if kind == "" && strings.Contains(strings.ToLower(reply.Server), "cloudflare") {
-			switch reply.Status {
-			case http.StatusForbidden:
-				kind = "拦截"
-			case http.StatusServiceUnavailable:
-				kind = "限流"
-			}
+		shielded := strings.Contains(strings.ToLower(reply.Server), "cloudflare")
+		switch {
+		case containsAny(head, []string{"just a moment", "cf-challenge", "challenge-platform", "_cf_chl_", "cf_chl_opt", "checking your browser", "enable javascript and cookies", "please wait while we check"}):
+			kind = "挑战"
+		case containsAny(head, []string{"attention required", "ddos protection by", "under attack mode"}) ||
+			shielded && reply.Status == http.StatusForbidden:
+			kind = "拦截"
+		case shielded && reply.Status == http.StatusServiceUnavailable:
+			kind = "限流"
 		}
 	}
 	if kind != "" {
@@ -561,7 +552,7 @@ func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, r
 
 // 寻找友链页面
 func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *Result, hosts *hostSet) []string {
-	candidates := siteURLs(site.Host, sitemapPaths)
+	candidates := siteURLs(site.Host, []string{"/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/index.xml"})
 	if recalled := scout.lookup("sitemap"); recalled != "" {
 		candidates = append([]string{"https://" + site.Host + recalled}, candidates...)
 	}
@@ -583,7 +574,7 @@ func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *R
 	var seeds []string
 	for _, entry := range append(document.URLs, document.Sitemaps...) {
 		link := entry.Loc
-		if link == "" || inDomainSet(normalizeHost(link), hubHosts) {
+		if link == "" || inDomainSet(normalizeHost(link), blockHosts) {
 			continue
 		}
 		hosts.keep(link)
@@ -597,41 +588,28 @@ func (scout *Scout) probeSitemap(task context.Context, site *BlogSite, result *R
 
 // 抓取友链页面
 func (scout *Scout) expand(task context.Context, site *BlogSite, page Home, result *Result, registrable string, hosts *hostSet, seeds []string) {
-	if inDomainSet(site.Host, hubHosts) {
+	if inDomainSet(site.Host, blockHosts) {
 		return
 	}
 	key := page.Framework
 	if key == "" {
 		key = "default"
 	}
-	if len(seeds) > 3 {
-		seeds = seeds[:3]
-	}
-	homeFriends := page.Friends
-	if len(homeFriends) > 3 {
-		homeFriends = homeFriends[:3]
-	}
-	candidates := make([]string, 0, len(seeds)+len(homeFriends)+len(friendPaths)+1)
+	candidates := make([]string, 0, len(page.Friends)+len(seeds)+len(friendPaths)+1)
 	if recalled := scout.lookup("friend:" + key); recalled != "" {
 		candidates = append(candidates, "https://"+site.Host+recalled)
 	}
 	candidates = append(candidates, seeds...)
-	candidates = append(candidates, homeFriends...)
+	candidates = append(candidates, page.Friends...)
 	candidates = append(candidates, siteURLs(site.Host, friendPaths)...)
 	visited := map[string]bool{}
-	for tries := 0; tries < 3; tries++ {
-		candidate := ""
-		for len(candidates) > 0 {
-			candidate, candidates = candidates[0], candidates[1:]
-			if candidate != "" && !visited[candidate] {
-				visited[candidate] = true
-				break
-			}
-			candidate = ""
+	for len(candidates) > 0 {
+		candidate := candidates[0]
+		candidates = candidates[1:]
+		if candidate == "" || visited[candidate] {
+			continue
 		}
-		if candidate == "" {
-			return
-		}
+		visited[candidate] = true
 		reply, target, _ := scout.pick(task, result, []string{candidate}, nil)
 		if reply == nil {
 			continue
@@ -662,8 +640,8 @@ func (scout *Scout) harvestFriends(result *Result, registrable string, hosts *ho
 // 检测单个站点
 func (scout *Scout) inspect(task context.Context, site *BlogSite, full bool) Result {
 	result := Result{State: "alive"}
-	if HostOf(site.Host) == "" || inDomainSet(site.Host, hubHosts) || blockedHost(site.Host) {
-		result.State, result.Reason = "other", "非博客域名"
+	if HostOf(site.Host) == "" || inDomainSet(site.Host, blockHosts) || blockedHost(site.Host) {
+		result.State, result.Reason = "other", "其它站点"
 		return result
 	}
 	hosts := &hostSet{seen: map[string]bool{site.Host: true}}
