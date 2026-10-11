@@ -61,6 +61,10 @@ var junkWords = []string{"index of", "网站维护中", "建站中", "维护中"
 
 var feedTypes = []string{"atom", "rss", "feed+json"}
 
+var summaryNoise = []string{"will go into a meta tag", "recent content on "}
+
+var summaryBlank = map[string]bool{"description": true, "blog": true, "posts": true, "home": true, "just a moment": true}
+
 var archiveHints = []string{"archive", "归档", "分页", "/page/", "older", "newer"}
 
 var friendHints = []string{"友链", "友情链接", "链接", "friend"}
@@ -340,20 +344,7 @@ func tidyTitle(text string) string {
 func summaryText(text string) string {
 	word := plainText(text)
 	lower := strings.ToLower(word)
-	if strings.Contains(lower, "will go into a meta tag") || lower == "description" {
-		return ""
-	}
-	return clip(word, 256)
-}
-
-func feedSummary(text string) string {
-	word := plainText(text)
-	if utf8.RuneCountInString(word) < 4 {
-		return ""
-	}
-	lower := strings.ToLower(word)
-	if strings.HasPrefix(lower, "recent content on ") || lower == "blog" || lower == "posts" ||
-		lower == "home" || lower == "just a moment" {
+	if utf8.RuneCountInString(word) < 4 || containsAny(lower, summaryNoise) || summaryBlank[lower] {
 		return ""
 	}
 	return clip(word, 256)
@@ -649,14 +640,14 @@ func readPage(body []byte, origin string) Home {
 				if info.domAuthor == "" && tag != "article" && tag != "h1" && tag != "h2" {
 					style := strings.ToLower(attrOf(node, "class") + " " + attrOf(node, "id"))
 					if containsAny(style, authorMarks) {
-						info.domAuthor = pickFirst(info.domAuthor, textOf(node))
+						info.domAuthor = textOf(node)
 					}
 				}
 			}
 		}
 		if node.Type == html.TextNode && length < 4096 {
-			written, _ := texts.WriteString(node.Data)
-			length += written
+			texts.WriteString(node.Data)
+			length += len(node.Data)
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
 			walk(child, section)
@@ -718,7 +709,7 @@ func ParseSubscription(body []byte) Feed {
 		if json.Unmarshal(trimmed, &decoded) != nil {
 			return Feed{}
 		}
-		subscription = Feed{Parsed: true, Name: tidyTitle(decoded.Title), Summary: feedSummary(decoded.Description)}
+		subscription = Feed{Parsed: true, Name: tidyTitle(decoded.Title), Summary: summaryText(decoded.Description)}
 		for _, item := range decoded.Items {
 			for _, person := range item.Authors {
 				subscription.pushAuthor(person.Name)
@@ -729,7 +720,7 @@ func ParseSubscription(body []byte) Feed {
 		if unmarshalFeed(trimmed, &channel) != nil {
 			return Feed{}
 		}
-		subscription = Feed{Parsed: true, Name: tidyTitle(channel.Channel.Title), Language: cleanLang(channel.Channel.Language), Summary: feedSummary(channel.Channel.Description)}
+		subscription = Feed{Parsed: true, Name: tidyTitle(channel.Channel.Title), Language: cleanLang(channel.Channel.Language), Summary: summaryText(channel.Channel.Description)}
 		subscription.pushAuthor(channel.Channel.Creator)
 		subscription.pushAuthor(channel.Channel.ManagingEditor)
 		subscription.pushAuthor(channel.Channel.Author)
@@ -742,7 +733,7 @@ func ParseSubscription(body []byte) Feed {
 		if unmarshalFeed(trimmed, &document) != nil {
 			return Feed{}
 		}
-		subscription = Feed{Parsed: true, Name: tidyTitle(document.Title), Language: cleanLang(document.Language), Summary: feedSummary(document.Subtitle)}
+		subscription = Feed{Parsed: true, Name: tidyTitle(document.Title), Language: cleanLang(document.Language), Summary: summaryText(document.Subtitle)}
 		subscription.pushAuthor(document.Author.Name)
 		for _, entry := range document.Entries {
 			for _, person := range entry.Authors {

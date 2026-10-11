@@ -77,35 +77,31 @@ func seedHost(raw string) string {
 	return host
 }
 
-func (scout *Scout) probeHome(task context.Context, host string) (bool, bool) {
-	reply, target, failure := scout.tryEither(task, &Result{}, "https://"+host+"/", true)
+func (scout *Scout) probeHome(task context.Context, host string) bool {
+	origin := "https://" + host + "/"
+	reply, target, failure := scout.tryEither(task, &Result{}, origin, true)
 	if failure != nil {
 		var timeout interface{ Timeout() bool }
 		if errors.Is(failure, context.DeadlineExceeded) || (errors.As(failure, &timeout) && timeout.Timeout()) {
-			return true, false
+			return true
 		}
-		return false, true
+		if reply, target, failure = scout.tryEither(task, &Result{}, origin, true); failure != nil {
+			return false
+		}
 	}
 	if reply.Status == http.StatusOK {
 		page := readPage(reply.Body, target)
-		if errorPage(page.Name) || (page.Name == "" && page.Feed == "" && len(page.Links) == 0) {
-			return false, false
-		}
-		return true, false
+		return !errorPage(page.Name) && (page.Name != "" || page.Feed != "" || len(page.Links) != 0)
 	}
 	switch reply.Status {
 	case 402, 404, 410, 444, 451, 456, 530:
-		return false, false
+		return false
 	}
-	return true, false
+	return true
 }
 
 func (scout *Scout) probeSeed(task context.Context, candidate seedCandidate) bool {
-	live, flaky := scout.probeHome(task, candidate.host)
-	if !live && flaky {
-		live, _ = scout.probeHome(task, candidate.host)
-	}
-	if live {
+	if scout.probeHome(task, candidate.host) {
 		return true
 	}
 	if candidate.feed == "" {
@@ -120,9 +116,6 @@ func (scout *Scout) probeSeed(task context.Context, candidate seedCandidate) boo
 }
 
 func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) []seedCandidate {
-	if len(candidates) == 0 {
-		return candidates
-	}
 	alive := make([]bool, len(candidates))
 	queue := make(chan int)
 	var pool sync.WaitGroup
@@ -177,10 +170,7 @@ func SeedBlogs(table *BlogTable) error {
 		if tags == nil {
 			tags = []string{}
 		}
-		encoded, failure := json.Marshal(tags)
-		if failure != nil {
-			return failure
-		}
+		encoded, _ := json.Marshal(tags)
 		candidates = append(candidates, seedCandidate{
 			host: host, name: collapse(entry.Name), feed: strings.TrimSpace(entry.Feed), tags: string(encoded),
 		})

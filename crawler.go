@@ -300,14 +300,18 @@ func dnsMissing(failure error) bool {
 		(record.IsNotFound || strings.Contains(record.Err, "no data"))
 }
 
+func deadOrRetry(result *Result, failure error) {
+	if dnsMissing(failure) {
+		result.State, result.Reason = "dead", "地址无效"
+		return
+	}
+	mark(result, "pend", "抓取失败", failure.Error())
+}
+
 func resolveHost(task context.Context, site *BlogSite, result *Result) bool {
 	addresses, failure := net.DefaultResolver.LookupNetIP(task, "ip", site.Host)
 	if failure != nil {
-		if dnsMissing(failure) {
-			result.State, result.Reason = "dead", "地址无效"
-		} else {
-			mark(result, "pend", "抓取失败", failure.Error())
-		}
+		deadOrRetry(result, failure)
 		return false
 	}
 	if len(addresses) == 0 {
@@ -327,11 +331,7 @@ func (scout *Scout) walkHops(task context.Context, site *BlogSite, result *Resul
 		reply, target, failure = scout.tryEither(task, result, target, false)
 		tried[wanted], tried[target] = true, true
 		if failure != nil {
-			if dnsMissing(failure) {
-				result.State, result.Reason = "dead", "地址无效"
-			} else {
-				mark(result, "pend", "抓取失败", failure.Error())
-			}
+			deadOrRetry(result, failure)
 			return nil, "", false
 		}
 		if !reply.CertEnd.IsZero() {
