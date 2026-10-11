@@ -29,100 +29,44 @@ type seedCandidate struct {
 	tags string
 }
 
-// 下载种子
-func downloadSeed(target string) ([]byte, error) {
-	var last error
-	for attempt := 0; attempt < 3; attempt++ {
-		time.Sleep(time.Duration(attempt) * 2 * time.Second)
-		request, failure := http.NewRequest(http.MethodGet, target, nil)
-		if failure != nil {
-			return nil, failure
-		}
-		response, failure := (&http.Client{Timeout: 60 * time.Second}).Do(request)
-		if failure != nil {
-			last = failure
-			continue
-		}
-		body, failure := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-		response.Body.Close()
-		if failure != nil {
-			last = failure
-			continue
-		}
-		if response.StatusCode != http.StatusOK {
-			last = fmt.Errorf("下载失败：%d", response.StatusCode)
-			continue
-		}
-		return body, nil
-	}
-	return nil, last
-}
-
-// 清洗种子主机
-func seedHost(raw string) string {
-	host := normalizeHost(raw)
-	if host == "" {
-		return ""
-	}
-	host = HostOf(host)
-	if host == "" {
-		return ""
-	}
-	registrable := registrableOf(host)
-	if registrable == "" {
-		return host
-	}
-	if host != registrable && host != "blog."+registrable {
-		return ""
-	}
-	if hubHosts[registrable] {
-		return ""
-	}
-	return host
-}
-
-// 探测首页
-func (scout *Scout) probeHome(task context.Context, host string) bool {
-	origin := "https://" + host + "/"
-	reply, target, failure := scout.tryEither(task, &Result{}, origin, true)
-	if failure != nil {
-		var timeout interface{ Timeout() bool }
-		if errors.Is(failure, context.DeadlineExceeded) || (errors.As(failure, &timeout) && timeout.Timeout()) {
-			return true
-		}
-		if reply, target, failure = scout.tryEither(task, &Result{}, origin, true); failure != nil {
-			return false
-		}
-	}
-	if reply.Status == http.StatusOK {
-		page := readPage(reply.Body, target)
-		return !errorPage(page.Name) && (page.Name != "" || page.Feed != "" || page.HasLinks)
-	}
-	switch reply.Status {
-	case 402, 404, 410, 444, 451, 456, 530:
-		return false
-	}
-	return true
-}
-
-// 探测单种子
-func (scout *Scout) probeSeed(task context.Context, candidate seedCandidate) bool {
-	if scout.probeHome(task, candidate.host) {
-		return true
-	}
-	if candidate.feed == "" {
-		return false
-	}
-	target := strings.TrimSpace(candidate.feed)
-	if !strings.HasPrefix(target, "http") {
-		target = "https://" + candidate.host + "/" + strings.TrimPrefix(target, "/")
-	}
-	reply, _, failure := scout.tryEither(task, &Result{}, target, true)
-	return failure == nil && reply.Status == http.StatusOK && ParseSubscription(reply.Body).Parsed
-}
-
 // 并发探种子
 func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) []seedCandidate {
+	judge := func(reply *Reply, target string) bool {
+		if reply.Status == http.StatusOK {
+			page := readPage(reply.Body, target)
+			return !errorPage(page.Name) && (page.Name != "" || page.Feed != "" || page.HasLinks)
+		}
+		switch reply.Status {
+		case 402, 404, 410, 444, 451, 456, 530:
+			return false
+		}
+		return true
+	}
+	probe := func(task context.Context, candidate seedCandidate) bool {
+		origin := "https://" + candidate.host + "/"
+		reply, target, failure := scout.tryEither(task, &Result{}, origin, true)
+		alive := false
+		switch {
+		case failure == nil:
+			alive = judge(reply, target)
+		default:
+			var timeout interface{ Timeout() bool }
+			if errors.Is(failure, context.DeadlineExceeded) || (errors.As(failure, &timeout) && timeout.Timeout()) {
+				alive = true
+			} else if reply, target, failure = scout.tryEither(task, &Result{}, origin, true); failure == nil {
+				alive = judge(reply, target)
+			}
+		}
+		if alive || candidate.feed == "" {
+			return alive
+		}
+		feed := strings.TrimSpace(candidate.feed)
+		if !strings.HasPrefix(feed, "http") {
+			feed = "https://" + candidate.host + "/" + strings.TrimPrefix(feed, "/")
+		}
+		reply, _, failure = scout.tryEither(task, &Result{}, feed, true)
+		return failure == nil && reply.Status == http.StatusOK && ParseSubscription(reply.Body).Parsed
+	}
 	alive := make([]bool, len(candidates))
 	queue := make(chan int)
 	var pool sync.WaitGroup
@@ -132,7 +76,7 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 			defer pool.Done()
 			for slot := range queue {
 				probeCtx, cancel := context.WithTimeout(task, 25*time.Second)
-				alive[slot] = scout.probeSeed(probeCtx, candidates[slot])
+				alive[slot] = probe(probeCtx, candidates[slot])
 				cancel()
 			}
 		}()
@@ -155,9 +99,34 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 
 // 导入种子
 func SeedBlogs(table *BlogTable) error {
-	body, failure := downloadSeed("https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json")
-	if failure != nil {
-		return failure
+	target := "https://cdn.jsdelivr.net/gh/timqian/chinese-independent-blogs@master/data/blogs.json"
+	var body []byte
+	var last error
+	for attempt := 0; attempt < 3 && body == nil; attempt++ {
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		request, failure := http.NewRequest(http.MethodGet, target, nil)
+		if failure != nil {
+			return failure
+		}
+		response, failure := (&http.Client{Timeout: 60 * time.Second}).Do(request)
+		if failure != nil {
+			last = failure
+			continue
+		}
+		text, failure := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+		response.Body.Close()
+		if failure != nil {
+			last = failure
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			last = fmt.Errorf("下载失败：%d", response.StatusCode)
+			continue
+		}
+		body = text
+	}
+	if body == nil {
+		return last
 	}
 	var document struct {
 		Blogs []seedEntry `json:"blogs"`
@@ -169,8 +138,16 @@ func SeedBlogs(table *BlogTable) error {
 	seen := map[string]bool{}
 	candidates := make([]seedCandidate, 0, len(document.Blogs))
 	for _, entry := range document.Blogs {
-		host := seedHost(entry.URL)
-		if host == "" || seen[host] {
+		host := normalizeHost(entry.URL)
+		registrable := registrableOf(host)
+		if host == "" || inDomainSet(host, hubHosts) {
+			continue
+		}
+		host = HostOf(host)
+		if host == "" || (registrable != "" && host != registrable && host != "blog."+registrable) {
+			continue
+		}
+		if seen[host] {
 			continue
 		}
 		seen[host] = true

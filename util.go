@@ -3,15 +3,12 @@ package main
 import (
 	"bytes"
 	"net/url"
-	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
 )
-
-var htmlTag = regexp.MustCompile(`<[^>]*>`)
 
 // 拼占位符
 func slots(count int) string {
@@ -34,11 +31,6 @@ func clip(text string, limit int) string {
 // 判命中任一
 func containsAny(text string, marks []string) bool {
 	return slices.ContainsFunc(marks, func(mark string) bool { return strings.Contains(text, mark) })
-}
-
-// 取纯文本
-func plainText(text string) string {
-	return collapse(htmlTag.ReplaceAllString(html.UnescapeString(text), " "))
 }
 
 // 取首个非空
@@ -86,4 +78,9 @@ func resolveLink(link string, root *url.URL) *url.URL {
 		return parsed
 	}
 	return root.ResolveReference(parsed)
+}
+
+// 判通用词
+func genericName(name string) bool {
+	return genericNames[strings.ToLower(strings.TrimSpace(name))]
 }

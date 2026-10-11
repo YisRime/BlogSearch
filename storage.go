@@ -76,9 +76,11 @@ func (table *BlogTable) queueHosts(hosts []string, now time.Time) {
 	stamp := now.Format(time.RFC3339)
 	valid := make([]string, 0, len(hosts))
 	for _, raw := range hosts {
-		if host := HostOf(raw); host != "" {
-			valid = append(valid, host)
+		host := HostOf(raw)
+		if host == "" || inDomainSet(host, hubHosts) {
+			continue
 		}
+		valid = append(valid, host)
 	}
 	for start := 0; start < len(valid); start += 256 {
 		batch := valid[start:min(start+256, len(valid))]
@@ -185,11 +187,6 @@ func (table *BlogTable) friendIndex(hosts []string) string {
 	return string(text)
 }
 
-// 算重试间隔
-func retryDelay(attempt int) time.Duration {
-	return min(time.Duration(attempt)*24*time.Hour, 7*24*time.Hour)
-}
-
 // 写回数据库
 func (table *BlogTable) persist(site *BlogSite, result Result) {
 	now := time.Now().UTC()
@@ -215,7 +212,7 @@ func (table *BlogTable) persist(site *BlogSite, result Result) {
 		if site.Retry >= 3 {
 			site.State, site.CheckAt = "fail", ""
 		} else {
-			schedule(retryDelay(site.Retry))
+			schedule(min(time.Duration(site.Retry)*24*time.Hour, 7*24*time.Hour))
 		}
 	}
 	site.Cert = site.Cert || result.Cert
