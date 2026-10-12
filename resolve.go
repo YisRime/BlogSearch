@@ -22,68 +22,70 @@ import (
 var blockHosts = map[string]bool{}
 
 // 页面拦截词表
-var blockWords = []string{"页面不存在", "找不到", "未找到", "域名出售", "域名停放", "域名已过期", "建站中", "买球",
-	"赌球", "棋牌", "娱乐城", "博彩", "下注", "彩票", "投注", "免费观看", "招聘", "正在出售", "此域名", "域名专家", "域名中介",
-	"购彩", "球友会", "球盟会", "免费直播", "直播吧", "登录入口", "真人视讯", "电子游艺", "包赢", "404", "not found",
-	"denied", "welcome to nginx", "index of", "default web site page", "for sale",
-	"expired", "suspended", "construction", "recent content on ", "career", "job",
-	"recruit", "hiring", "afternic", "sedo", "hugedomains", "parked"}
+var blockWords = []string{"页面不存在", "找不到", "未找到", "域名", "出售", "建站中", "买球",
+	"棋牌", "娱乐城", "博彩", "下注", "彩票", "投注", "免费观看", "招聘", "购彩", "球友会", "球盟会",
+	"免费直播", "登录入口", "真人视讯", "电子游艺", "包赢", "赌球", "404", "not found", "denied",
+	"welcome to nginx", "index of", "default web site page", "for sale",
+	"expired", "suspended", "construction", "recent content", "career", "job",
+	"recruit", "hiring", "afternic", "sedo", "hugedomains", "parked", "forbidden"}
 
 // 错误页面标记
-var errorMarks = []string{"导航", "大全", "合集", "收录", "有限公司", "责任公司", "集团", "商城", "银行", "证券",
-	"保险", "正品", "光临", "直播", "私服", "加速器", "press release", "news center", "corporation",
-	"holdings", "investor", "pharmaceutical", "insurance", "securities", "nasdaq", "nyse"}
+var errorMarks = []string{"导航", "大全", "合集", "收录", "公司", "集团", "商城", "银行", "保险",
+	"正品", "光临", "直播", "私服", "加速器", "已暂停", "在线看", "创建成功", "证券", "press release",
+	"news center", "redirecting", "comments on", "corporation", "holdings",
+	"investor", "pharmaceutical", "insurance", "securities", "nasdaq", "nyse"}
 
 // 文本截断词表
 var cutWords = []string{"，", "。", "！", "？", "；", "：", "、", "…", "“",
-	"”", "—", "–", "（", "©", "备案", "保留", ",", ";", "<", "(", "powered",
-	"built", "generated", "copyright", "all rights", "icp"}
+	"”", "—", "–", "（", "©", "备案", "保留", "·", "•", ",", ";", "<", "(",
+	"|", "powered", "built", "generated", "copyright", "all rights", "icp"}
 
 // 噪声节点标记
-var friendSkipMarks = []string{"nav", "menu", "footer", "header", "social", "share", "comment",
-	"breadcrumb", "pagination", "copyright", "credit", "powered", "widget", "sidebar", "toolbar",
-	"privacy", "policy", "agreement", "cookie", "legal", "disclaimer", "terms", "third"}
+var friendSkipMarks = []string{"nav", "menu", "footer", "header",
+	"social", "share", "comment", "breadcrumb", "pagination", "copyright",
+	"credit", "powered", "widget", "sidebar", "toolbar", "privacy",
+	"policy", "agreement", "cookie", "legal", "disclaimer", "terms"}
 
 // 友链识别标记
-var friendMarks = []string{"友链", "友邻", "朋友", "友情",
-	"friend", "blogroll", "link", "blogmate", "blogger"}
+var friendMarks = []string{"友链", "友邻", "朋友", "友情", "friend", "blogroll", "link"}
 
 // 友链名称噪声
-var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "一页", "全文", "评论",
-	"留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链", "工具", "平台", "官网", "导航",
-	"资源", "下载", "文档", "社区", "论坛", "联系", "捐赠", "赞助", "广告", "统计", "站点", "网站", "应用", "服务", "产品",
-	"项目", "详情", "查看", "进入", "点击", "跳转", "访问", "home", "more", "back", "next", "prev", "about",
-	"archive", "tag", "category", "rss", "search", "link", "tool", "platform", "website", "resource",
-	"download", "doc", "forum", "community", "contact", "sponsor", "donate", "stats", "visit"}
+var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "一页", "全文", "评论", "导航",
+	"留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链", "工具", "平台", "官网", "资源",
+	"下载", "文档", "社区", "论坛", "联系", "捐赠", "赞助", "广告", "统计", "站点", "应用", "服务", "产品", "项目", "详情",
+	"查看", "进入", "点击", "跳转", "访问", "more", "about", "archive", "category", "rss", "links", "tools",
+	"platform", "resource", "download", "doc", "forum", "community", "contact", "sponsor", "donate"}
 
 // 通用标题词表
 var genericNames = map[string]bool{"首页": true, "主页": true, "网站首页": true,
 	"欢迎": true, "博客": true, "频道": true, "关于": true, "个人博客": true, "我的博客": true,
-	"网站主页": true, "home": true, "homepage": true, "blog": true, "index": true,
-	"untitled": true, "start": true, "welcome": true, "description": true, "posts": true,
-	"just a moment": true, "about": true, "about me": true, "main": true, "portal": true}
+	"网站主页": true, "的评论": true, "home": true, "homepage": true, "home page": true,
+	"blog": true, "index": true, "untitled": true, "start": true, "welcome": true,
+	"description": true, "posts": true, "about": true, "about me": true,
+	"main": true, "portal": true, "hello world": true, "hexo": true, "gridea": true}
 
 // 作者名称噪声
-var authorNoise = map[string]bool{"互动": true, "评论": true, "登录": true, "注册": true, "分享": true,
-	"首页": true, "投稿": true, "作者": true, "博主": true, "日期": true, "时间": true, "張貼者": true,
-	"张贴者": true, "by": true, "posted by": true, "admin": true, "administrator": true,
-	"author": true, "unknown": true, "anonymous": true, "none": true, "n/a": true, "na": true}
+var authorNoise = map[string]bool{"互动": true, "评论": true, "登录": true, "注册": true,
+	"分享": true, "首页": true, "投稿": true, "作者": true, "博主": true, "日期": true, "时间": true,
+	"張貼者": true, "张贴者": true, "管理员": true, "站长": true, "by": true, "posted by": true,
+	"admin": true, "administrator": true, "author": true, "unknown": true, "anonymous": true,
+	"none": true, "n/a": true, "na": true, "seo": true, "john doe": true, "xxxx": true}
 
 // 框架名称噪声
 var frameworkNoise = map[string]bool{"by": true, "with": true, "using": true,
-	"powered": true, "and": true, "the": true, "for": true, "on": true,
-	"in": true, "a": true, "an": true, "built": true, "version": true,
-	"all": true, "site": true, "kit": true, "wp": true, "seo": true,
-	"google": true, "microsoft": true, "clarity": true, "elementor": true,
-	"rocket": true, "pro": true, "cache": true, "plugin": true, "theme": true}
+	"powered": true, "and": true, "the": true, "for": true, "on": true, "in": true,
+	"a": true, "an": true, "built": true, "version": true, "all": true, "site": true,
+	"kit": true, "wp": true, "seo": true, "google": true, "microsoft": true,
+	"clarity": true, "elementor": true, "rocket": true, "pro": true, "cache": true,
+	"plugin": true, "theme": true, "yoast": true, "jetpack": true, "woocommerce": true}
 
 // 框架识别特征
 var frameworkMarks = [][3]string{{"wordpress", "wp-content", "WordPress"},
 	{"typecho", "/usr/themes/", "Typecho"}, {"hexo", "hexo-theme", "Hexo"},
-	{"astro", "/_astro/", "Astro"}, {"next.js", "_next/", "Next.js"},
-	{"nuxt", "/_nuxt/", "Nuxt"}, {"gatsby", "___gatsby", "Gatsby"},
-	{"ghost", "/assets/built/", "Ghost"}, {"halo", "halo-theme", "Halo"},
-	{"sveltekit", "__sveltekit", "SvelteKit"}, {"remix", "__remix", "Remix"}}
+	{"astro", "/_astro/", "Astro"}, {"next.js", "_next/", "Next.js"}, {"nuxt", "/_nuxt/", "Nuxt"},
+	{"gatsby", "___gatsby", "Gatsby"}, {"ghost", "/assets/built/", "Ghost"},
+	{"halo", "halo-theme", "Halo"}, {"sveltekit", "__sveltekit", "SvelteKit"},
+	{"remix", "__remix", "Remix"}, {"docusaurus", "__docusaurus", "Docusaurus"}}
 
 // 标签剥离正则
 var htmlTag = regexp.MustCompile(`<[^>]*>`)
