@@ -52,6 +52,16 @@ func containsAny(text string, marks []string) bool {
 	return slices.ContainsFunc(marks, func(mark string) bool { return strings.Contains(text, mark) })
 }
 
+// 寻找首个命中
+func firstMark(text string, marks []string) (string, bool) {
+	for _, mark := range marks {
+		if strings.Contains(text, mark) {
+			return mark, true
+		}
+	}
+	return "", false
+}
+
 // 选择首个非空
 func pickFirst(values ...string) string {
 	for _, value := range values {

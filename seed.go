@@ -33,8 +33,8 @@ func probeSeeds(task context.Context, scout *Scout, candidates []seedCandidate) 
 	judge := func(reply *Reply, target string) bool {
 		if reply.Status == http.StatusOK {
 			page := readPage(reply.Body, target)
-			return !errorPage(page.Name) &&
-				(page.Feed != "" || page.HasArchive || len(page.Friends) > 0)
+			ok, _ := errorPage(page.Name)
+			return !ok && (page.Feed != "" || page.HasArchive || len(page.Friends) > 0)
 		}
 		switch reply.Status {
 		case 402, 404, 410, 444, 451, 456, 530:

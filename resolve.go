@@ -212,7 +212,8 @@ func init() {
 
 // 检查拦截词语
 func blockedText(text string) bool {
-	return containsAny(strings.ToLower(text), blockWords)
+	_, hit := firstMark(strings.ToLower(text), blockWords)
+	return hit
 }
 
 // 检查拦截域名
@@ -325,9 +326,15 @@ func HostOf(host string) string {
 }
 
 // 识别错误页面
-func errorPage(name string) bool {
+func errorPage(name string) (bool, string) {
 	word := strings.ToLower(collapse(name))
-	return blockedText(word) || containsAny(word, errorMarks)
+	if mark, hit := firstMark(word, blockWords); hit {
+		return true, mark
+	}
+	if mark, hit := firstMark(word, errorMarks); hit {
+		return true, mark
+	}
+	return false, ""
 }
 
 // 判断站点性质
@@ -335,14 +342,14 @@ func classify(site *BlogSite, page Home, result *Result, done bool) (string, str
 	label := collapse(page.Name)
 	plain := result.Feed == "" && site.Feed == "" && result.Framework == "" && result.ICP == "" &&
 		!page.HasArchive && len(result.Friends) == 0
-	switch {
-	case errorPage(page.Name):
+	if hit, mark := errorPage(page.Name); hit {
 		if site.State == "alive" {
-			return "pend", "页面错误"
+			return "pend", "页面错误：" + mark
 		}
-		return "other", "页面错误"
-	case done && (page.SinglePost && !page.HasArchive ||
-		plain && (inDomainSet(site.Host, blockHosts) || label == "" || genericName(label))):
+		return "other", "页面错误：" + mark
+	}
+	if done && (page.SinglePost && !page.HasArchive ||
+		plain && (inDomainSet(site.Host, blockHosts) || label == "" || genericName(label))) {
 		return "other", "其它站点"
 	}
 	return "", ""
