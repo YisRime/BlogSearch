@@ -467,9 +467,9 @@ func (scout *Scout) home(task context.Context, site *BlogSite, result *Result, r
 		head := strings.ToLower(string(reply.Body[:min(len(reply.Body), 8192)]))
 		shielded := strings.Contains(strings.ToLower(reply.Server), "cloudflare")
 		switch {
-		case containsAny(head, []string{"just a moment", "cf-challenge", "challenge-platform", "_cf_chl_", "cf_chl_opt", "checking your browser", "enable javascript and cookies", "please wait while we check"}):
+		case containsAny(head, []string{"just a moment", "cf-challenge", "challenge-platform", "cf_chl_", "checking your browser", "enable javascript and cookies", "please wait while we check"}):
 			kind = "挑战"
-		case containsAny(head, []string{"attention required", "ddos protection by", "under attack mode"}) ||
+		case containsAny(head, []string{"attention required", "ddos protection", "under attack"}) ||
 			shielded && reply.Status == http.StatusForbidden:
 			kind = "拦截"
 		case shielded && reply.Status == http.StatusServiceUnavailable:
