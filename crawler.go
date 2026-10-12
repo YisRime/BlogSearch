@@ -529,7 +529,9 @@ func (scout *Scout) subscribe(task context.Context, site *BlogSite, page Home, r
 		result.Feed = target
 		scout.remember("feed:"+key, target)
 		if subscription.Name != "" && !genericName(subscription.Name) {
-			result.Name = subscription.Name
+			if hit, _ := errorPage(subscription.Name); !hit {
+				result.Name = subscription.Name
+			}
 		}
 		if len(subscription.Authors) == 1 {
 			result.Author = subscription.Authors[0]

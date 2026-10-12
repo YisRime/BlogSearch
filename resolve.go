@@ -24,16 +24,18 @@ var blockHosts = map[string]bool{}
 // 页面拦截词表
 var blockWords = []string{"页面不存在", "找不到", "未找到", "域名", "出售", "建站中", "买球",
 	"棋牌", "娱乐城", "博彩", "下注", "彩票", "投注", "免费观看", "招聘", "购彩", "球友会", "球盟会",
-	"免费直播", "登录入口", "真人视讯", "电子游艺", "包赢", "赌球", "404", "not found", "denied",
-	"welcome to nginx", "index of", "default web site page", "for sale",
-	"expired", "suspended", "construction", "recent content", "career", "job",
+	"免费直播", "登录入口", "真人视讯", "电子游艺", "包赢", "赌球", "科技媒体", "配资", "仿制", "证件",
+	"welcome to nginx", "index of", "default web site page", "for sale", "404", "not found",
+	"expired", "suspended", "construction", "recent content", "career", "job", "denied",
 	"recruit", "hiring", "afternic", "sedo", "hugedomains", "parked", "forbidden"}
 
 // 错误页面标记
 var errorMarks = []string{"导航", "大全", "合集", "收录", "公司", "集团", "商城", "银行", "保险",
-	"正品", "光临", "直播", "私服", "加速器", "已暂停", "在线看", "创建成功", "证券", "press release",
-	"news center", "redirecting", "comments on", "corporation", "holdings",
-	"investor", "pharmaceutical", "insurance", "securities", "nasdaq", "nyse"}
+	"正品", "光临", "直播", "私服", "加速器", "已暂停", "在线看", "创建成功", "证券", "媒体",
+	"传媒", "培训", "教育", "学院", "课程", "影院", "赞助商", "信誉", "龙头", "论坛", "联盟",
+	"社区", "门户", "世界杯", "赛程", "团队", "经纪商", "外汇", "企业", "官网", "机构", "insurance",
+	"下载中心", "软件下载", "资源网", "press release", "corporation", "holdings", "pharmaceutical",
+	"news center", "redirecting", "comments on", "securities", "nasdaq", "nyse", "investor"}
 
 // 文本截断词表
 var cutWords = []string{"，", "。", "！", "？", "；", "：", "、", "…", "“",
@@ -50,26 +52,25 @@ var friendSkipMarks = []string{"nav", "menu", "footer", "header",
 var friendMarks = []string{"友链", "友邻", "朋友", "友情", "friend", "blogroll", "link"}
 
 // 友链名称噪声
-var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "一页", "全文", "评论", "导航",
-	"留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链", "工具", "平台", "官网", "资源",
-	"下载", "文档", "社区", "论坛", "联系", "捐赠", "赞助", "广告", "统计", "站点", "应用", "服务", "产品", "项目", "详情",
+var friendNameNoise = []string{"申请", "添加", "提交", "首页", "更多", "返回", "全文", "评论", "导航", "官网", "资源",
+	"留言", "关于", "归档", "标签", "分类", "订阅", "登录", "注册", "搜索", "友情链接", "友链", "工具", "平台", "详情",
+	"下载", "文档", "社区", "论坛", "联系", "捐赠", "赞助", "广告", "统计", "站点", "应用", "服务", "产品", "项目",
 	"查看", "进入", "点击", "跳转", "访问", "more", "about", "archive", "category", "rss", "links", "tools",
 	"platform", "resource", "download", "doc", "forum", "community", "contact", "sponsor", "donate"}
 
 // 通用标题词表
-var genericNames = map[string]bool{"首页": true, "主页": true, "网站首页": true,
-	"欢迎": true, "博客": true, "频道": true, "关于": true, "个人博客": true, "我的博客": true,
-	"网站主页": true, "的评论": true, "home": true, "homepage": true, "home page": true,
-	"blog": true, "index": true, "untitled": true, "start": true, "welcome": true,
-	"description": true, "posts": true, "about": true, "about me": true,
-	"main": true, "portal": true, "hello world": true, "hexo": true, "gridea": true}
+var genericNames = map[string]bool{"首页": true, "主页": true, "网站首页": true, "平台": true,
+	"欢迎": true, "博客": true, "频道": true, "关于": true, "网站主页": true, "的评论": true,
+	"home": true, "homepage": true, "home page": true, "hexo": true, "gridea": true, "hello world": true,
+	"blog": true, "index": true, "untitled": true, "start": true, "welcome": true, "portal": true,
+	"description": true, "posts": true, "about": true, "about me": true, "main": true}
 
 // 作者名称噪声
 var authorNoise = map[string]bool{"互动": true, "评论": true, "登录": true, "注册": true,
-	"分享": true, "首页": true, "投稿": true, "作者": true, "博主": true, "日期": true, "时间": true,
-	"張貼者": true, "张贴者": true, "管理员": true, "站长": true, "by": true, "posted by": true,
-	"admin": true, "administrator": true, "author": true, "unknown": true, "anonymous": true,
-	"none": true, "n/a": true, "na": true, "seo": true, "john doe": true, "xxxx": true}
+	"分享": true, "首页": true, "投稿": true, "作者": true, "博主": true, "日期": true,
+	"张贴者": true, "管理员": true, "站长": true, "时间": true, "by": true, "posted by": true,
+	"admin": true, "administrator": true, "author": true, "unknown": true,
+	"none": true, "n/a": true, "na": true, "seo": true, "anonymous": true}
 
 // 框架名称噪声
 var frameworkNoise = map[string]bool{"by": true, "with": true, "using": true,
@@ -339,10 +340,11 @@ func errorPage(name string) (bool, string) {
 
 // 判断站点性质
 func classify(site *BlogSite, page Home, result *Result, done bool) (string, string) {
-	label := collapse(page.Name)
+	name := pickFirst(result.Name, page.Name)
+	label := collapse(name)
 	plain := result.Feed == "" && site.Feed == "" && result.Framework == "" && result.ICP == "" &&
 		!page.HasArchive && len(result.Friends) == 0
-	if hit, mark := errorPage(page.Name); hit {
+	if hit, mark := errorPage(name); hit {
 		if site.State == "alive" {
 			return "pend", "页面错误：" + mark
 		}
@@ -403,6 +405,12 @@ func cleanLang(text string) string {
 func tidyTitle(text string) string {
 	full := collapse(html.UnescapeString(text))
 	name := full
+	for _, tail := range []string{"-官网首页", "|官网首页", "_官网首页", " - 官网首页"} {
+		if strings.HasSuffix(name, tail) {
+			name = strings.TrimSpace(strings.TrimSuffix(name, tail))
+			break
+		}
+	}
 	cut := max(strings.IndexAny(name, "｜·»•・"), 0)
 	offset := 0
 	for _, field := range strings.Fields(name) {
@@ -457,7 +465,8 @@ func authorName(text string, refs ...string) string {
 	}
 	word = trimSymbols(strings.TrimPrefix(word, "@"))
 	if !nameOK(word, 16, 6) || strings.ContainsAny(word, "0123456789@©") ||
-		strings.Trim(word, "0123456789") == "" || authorNoise[strings.ToLower(word)] {
+		strings.Trim(word, "0123456789") == "" || authorNoise[strings.ToLower(word)] ||
+		containsAny(word, errorMarks) {
 		return ""
 	}
 	lower := strings.ToLower(word)
